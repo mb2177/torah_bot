@@ -8,6 +8,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -24,22 +25,20 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.job import Job
 
 from openai import AsyncOpenAI
-from openai import APITimeoutError, APIError
 
 # ---------- ЛОГИ ----------
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ---------- OPENAI КЛИЕНТ ----------
+# ---------- OPENAI ----------
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set. Bot will not be able to generate texts.")
+    logger.warning("OPENAI_API_KEY is not set. Generation will not work.")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -86,7 +85,7 @@ SYSTEM_PROMPT = """
 Не пиши ничего про правила и инструкции, отвечай только конечным текстом для пользователя.
 """
 
-# ---------- НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ ----------
+# ---------- МОДЕЛИ ДАННЫХ ----------
 
 class Language(str, Enum):
     RU = "ru"
@@ -146,6 +145,7 @@ TIMEZONE_AWAIT_USERS: set[int] = set()
 
 scheduler = AsyncIOScheduler()
 
+
 def map_send_time_to_hour_minute(send_time: SendTime) -> Tuple[int, int]:
     if send_time == SendTime.MORNING:
         return 9, 0
@@ -155,13 +155,15 @@ def map_send_time_to_hour_minute(send_time: SendTime) -> Tuple[int, int]:
         return 20, 0
     return 12, 0  # ANYTIME
 
-# ---------- ГЛАВА (ПОКА ЗАГЛУШКА) ----------
+
+# ---------- ПАРША (пока заглушка) ----------
 
 def get_current_parsha() -> str:
-    # TODO: сюда потом подключим реальный календарь
+    # TODO: заменить на реальный календарь
     return "Vayishlach"
 
-# ---------- ГЕНЕРАЦИЯ ТЕКСТА ----------
+
+# ---------- PROMPT ДЛЯ OPENAI ----------
 
 def build_user_prompt(
     language: str,
@@ -212,17 +214,18 @@ def build_user_prompt(
     )
 
 
+# ---------- ГЕНЕРАЦИЯ ТЕКСТА С GPT-5 + FALLBACK ----------
+
 async def generate_parsha_text(
     settings: UserSettings,
     mode: str,
     parsha_name: Optional[str] = None,
 ) -> str:
     if not OPENAI_API_KEY:
-        # fallback если забыли ключ
         if settings.language == Language.RU:
-            return "Сейчас генерация текста временно недоступна (нет ключа OpenAI)."
+            return "Генерация текста сейчас недоступна (не задан ключ OpenAI)."
         else:
-            return "Text generation is temporarily unavailable (no OpenAI API key set)."
+            return "Text generation is unavailable right now (no OpenAI API key set)."
 
     if parsha_name is None:
         parsha_name = get_current_parsha()
@@ -235,29 +238,39 @@ async def generate_parsha_text(
         mode=mode,
     )
 
-    try:
-        resp = await client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.7,
-            timeout=30,  # ограничиваем, чтобы не висело вечно
-        )
-        return resp.choices[0].message.content.strip()
-    except (APITimeoutError, APIError) as e:
-        logger.exception(f"OpenAI API error: {e}")
-        if settings.language == Language.RU:
-            return "Сейчас не удалось получить ответ от модели. Попробуй еще раз чуть позже."
-        else:
-            return "The model did not respond in time. Please try again a bit later."
-    except Exception as e:
-        logger.exception(f"Unexpected OpenAI error: {e}")
-        if settings.language == Language.RU:
-            return "Произошла техническая ошибка при генерации текста."
-        else:
-            return "A technical error occurred while generating the text."
+    # Пытаемся по очереди: GPT-5 mini → GPT-5 → GPT-4 mini
+    preferred_models = [
+        "gpt-5.1-mini",
+        "gpt-5.1",
+        "gpt-4.1-mini",
+    ]
+
+    last_error: Optional[Exception] = None
+
+    for model_name in preferred_models:
+        try:
+            resp = await client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.7,
+                timeout=25,
+            )
+            logger.info(f"Used model: {model_name}")
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"Model {model_name} failed: {e}")
+            last_error = e
+            continue
+
+    logger.error(f"All models failed: {last_error}")
+    if settings.language == Language.RU:
+        return "Сейчас не удалось получить ответ от модели. Попробуй ещё раз немного позже."
+    else:
+        return "All models failed to respond. Please try again later."
+
 
 # ---------- ФУНКЦИИ РАССЫЛКИ ----------
 
@@ -298,7 +311,7 @@ async def send_friday_toast_for_user(bot, user_id: int):
 
 
 def schedule_jobs_for_user(application: Application, settings: UserSettings):
-    # убрать старые задачи
+    # удаляем старые задачи
     for job_id in settings.job_ids.values():
         try:
             scheduler.remove_job(job_id)
@@ -337,6 +350,7 @@ def schedule_jobs_for_user(application: Application, settings: UserSettings):
     }
     logger.info(f"Scheduled jobs for user {settings.user_id}: {settings.job_ids}")
 
+
 # ---------- КОМАНДЫ ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,10 +373,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "/start — начать и настроить бота заново\n"
+        "Этот бот помогает понимать недельные главы Торы простым языком.\n\n"
+        "/start — пройти настройку заново\n"
         "/parsha — объяснение текущей недельной главы\n"
+        "/settings — показать твої настройки\n"
         "/help — краткая помощь\n"
     )
+    await update.message.reply_text(text)
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    settings = USER_SETTINGS.get(user_id)
+    if not settings:
+        await update.message.reply_text("Сначала введи /start, чтобы настроить бота.")
+        return
+
+    if settings.language == Language.RU:
+        text = (
+            "Твои текущие настройки:\n\n"
+            f"• Язык: русский\n"
+            f"• Уровень: {int(settings.level)}\n"
+            f"• Стиль: {settings.style.value}\n"
+            f"• Время отправки: {settings.send_time.value}\n"
+            f"• Часовой пояс: {settings.timezone}\n\n"
+            "Пока менять настройки можно только через /start (полная перенастройка).\n"
+            "Позже добавим отдельные кнопки изменения."
+        )
+    else:
+        text = (
+            "Your current settings:\n\n"
+            f"• Language: English\n"
+            f"• Level: {int(settings.level)}\n"
+            f"• Style: {settings.style.value}\n"
+            f"• Send time: {settings.send_time.value}\n"
+            f"• Timezone: {settings.timezone}\n\n"
+            "For now, you can change settings only via /start (full onboarding again).\n"
+            "Later we will add separate change commands."
+        )
+
     await update.message.reply_text(text)
 
 
@@ -376,6 +425,7 @@ async def parsha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsha_name = get_current_parsha()
     text = await generate_parsha_text(settings, mode="manual_parsha", parsha_name=parsha_name)
     await update.message.reply_text(text)
+
 
 # ---------- CALLBACK ОНБОРДИНГА ----------
 
@@ -452,24 +502,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Если не видишь нужный вариант — нажми «📍 Другое» и напиши, например: Europe/Berlin или America/New_York."
             )
             keyboard = [
-                [
-                    InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem"),
-                ],
-                [
-                    InlineKeyboardButton("🇷🇺 Moscow (Europe/Moscow)", callback_data="tz_Europe/Moscow"),
-                ],
-                [
-                    InlineKeyboardButton("🇩🇪 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin"),
-                ],
-                [
-                    InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai"),
-                ],
-                [
-                    InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York"),
-                ],
-                [
-                    InlineKeyboardButton("📍 Другое", callback_data="tz_custom"),
-                ],
+                [InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem")],
+                [InlineKeyboardButton("🇷🇺 Moscow (Europe/Moscow)", callback_data="tz_Europe/Moscow")],
+                [InlineKeyboardButton("🇩🇪 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin")],
+                [InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai")],
+                [InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York")],
+                [InlineKeyboardButton("📍 Другое", callback_data="tz_custom")],
             ]
         else:
             text = (
@@ -477,21 +515,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "If you do not see your option — tap “📍 Other” and send something like: Europe/Berlin or America/New_York."
             )
             keyboard = [
-                [
-                    InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem"),
-                ],
-                [
-                    InlineKeyboardButton("🇪🇺 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin"),
-                ],
-                [
-                    InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai"),
-                ],
-                [
-                    InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York"),
-                ],
-                [
-                    InlineKeyboardButton("📍 Other", callback_data="tz_custom"),
-                ],
+                [InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem")],
+                [InlineKeyboardButton("🇪🇺 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin")],
+                [InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai")],
+                [InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York")],
+                [InlineKeyboardButton("📍 Other", callback_data="tz_custom")],
             ]
 
         await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -583,15 +611,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Choose the style — you can change it anytime 😊"
             )
         keyboard = [
-            [
-                InlineKeyboardButton("Как другу / Friend", callback_data="style_friend"),
-            ],
-            [
-                InlineKeyboardButton("Как рассказ / Story", callback_data="style_story"),
-            ],
-            [
-                InlineKeyboardButton("Как раввин / Rabbi", callback_data="style_rabbi"),
-            ],
+            [InlineKeyboardButton("Как другу / Friend", callback_data="style_friend")],
+            [InlineKeyboardButton("Как рассказ / Story", callback_data="style_story")],
+            [InlineKeyboardButton("Как раввин / Rabbi", callback_data="style_rabbi")],
         ]
         await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -627,10 +649,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await generate_parsha_text(
             settings,
             mode="onboarding_now",
-            parsha_name=parsha_name
+            parsha_name=parsha_name,
         )
         await chat.send_message(text)
         return
+
 
 # ---------- ВВОД TIMEZONE ТЕКСТОМ ----------
 
@@ -687,6 +710,20 @@ async def timezone_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
+
+# ---------- POST_INIT: КОМАНДНОЕ МЕНЮ ----------
+
+async def post_init(application: Application):
+    commands = [
+        BotCommand("start", "Начать / изменить настройки"),
+        BotCommand("parsha", "Объяснение текущей главы"),
+        BotCommand("settings", "Показать мои настройки"),
+        BotCommand("help", "Помощь"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Bot commands menu set")
+
+
 # ---------- MAIN ----------
 
 def main():
@@ -694,20 +731,24 @@ def main():
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN is not set")
 
-    application = ApplicationBuilder().token(token).build()
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("parsha", parsha_command))
+
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, timezone_text_handler))
 
     scheduler.start()
     logger.info("Bot started")
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        poll_interval=1.0,
-    )
+    application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
 
 
 if __name__ == "__main__":
