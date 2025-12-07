@@ -340,7 +340,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        # на всякий случай
         await update.effective_chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -383,8 +382,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings.language = Language.RU
         text = (
             "Язык: русский.\n\n"
-            "Теперь выбери, когда тебе удобнее получать сообщения:\n"
-            "- ☀️ Утром\n- 🌤 Днем\n- 🌇 Вечером\n- 🔄 Не важно\n\n"
+            "Теперь выбери, когда тебе удобнее получать сообщения:\n\n"
+            "☀️ Утром\n🌤 Днем\n🌇 Вечером\n🔄 Не важно\n\n"
             "Это можно изменить в будущем."
         )
         keyboard = [
@@ -404,8 +403,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings.language = Language.EN
         text = (
             "Language set to English.\n\n"
-            "Now choose when you prefer to receive the messages:\n"
-            "- ☀️ Morning\n- 🌤 Day\n- 🌇 Evening\n- 🔄 Any time\n\n"
+            "Now choose when you prefer to receive the messages:\n\n"
+            "☀️ Morning\n🌤 Day\n🌇 Evening\n🔄 Any time\n\n"
             "You can change this later."
         )
         keyboard = [
@@ -543,19 +542,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if settings.language == Language.RU:
             text = (
-                "Как тебе удобнее, чтобы я объяснял главы?\n\n"
-                "«Как другу» - живо, по-человечески.\n"
-                "«Как рассказ» - плавно, как история.\n"
-                "«Как раввин» - по пунктам, но простым языком.\n\n"
-                "Стиль можно поменять в любой момент."
+                "Как тебе было бы комфортнее получать объяснения недельных глав?\n\n"
+                "🧑‍🤝‍🧑 Как другу\n"
+                "— Я объясняю простым разговорным языком, без лишних формальностей.\n"
+                "Пример: «Смотри, в этой главе происходит вот что… и вот почему это важно.»\n\n"
+                "📖 Как рассказ\n"
+                "— Плавно, спокойно, как короткую историю.\n"
+                "Пример: «Глава начинается с того, что… шаг за шагом события раскрывают идею.»\n\n"
+                "📌 Как раввин\n"
+                "— По пунктам и структурно, но простым языком.\n"
+                "Пример: «1) Сначала происходит это. 2) Затем — это. 3) А смысл такой.»\n\n"
+                "Выбери стиль — его можно поменять в любой момент 😊"
             )
         else:
             text = (
-                "How would you like me to explain the weekly portion?\n\n"
-                "“Like a friend” - conversational and warm.\n"
-                "“Like a story” - smooth, like a narrative.\n"
-                "“Like a rabbi” - structured, in clear points.\n\n"
-                "You can change this anytime."
+                "How would you like me to explain the weekly portions?\n\n"
+                "🧑‍🤝‍🧑 Like a friend\n"
+                "— Warm, simple, conversational.\n"
+                "Example: “So here’s what’s happening in this week’s portion, and why it matters.”\n\n"
+                "📖 Like a story\n"
+                "— Smooth and narrative, like a short chapter.\n"
+                "Example: “The portion opens with… and step by step the story reveals its idea.”\n\n"
+                "📌 Like a rabbi\n"
+                "— Structured and clear, but easy to understand.\n"
+                "Example: “1) This happens first. 2) Then this. 3) And here is the idea.”\n\n"
+                "Choose the style — you can change it anytime 😊"
             )
         keyboard = [
             [
@@ -571,22 +582,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # выбор стиля, конец онбординга
+    # выбор стиля — завершение онбординга
     if data.startswith("style_"):
         mapping = {
             "style_friend": Style.FRIEND,
             "style_story": Style.STORY,
             "style_rabbi": Style.RABBI,
         }
-        settings.style = mapping[data]
+        settings.style = mapping.get(data, Style.FRIEND)
 
-        # создаем задачи по расписанию с учетом таймзоны
-        schedule_jobs_for_user(context.application, settings)
+        # создаём персональное расписание
+        try:
+            schedule_jobs_for_user(context.application, settings)
+        except Exception as e:
+            logger.exception(f"Scheduler error: {e}")
+            await query.edit_message_text(
+                "Онбординг почти готов. Возникла ошибка при настройке расписания, но бот всё равно работает.\n"
+                "Если что — ты всегда можешь получить главу командой /parsha."
+            )
+            return
 
-        # отправляем объяснение текущей главы
+        # отправляем приветственный текст
         parsha_name = get_current_parsha()
-        text = await generate_parsha_text(settings, mode="onboarding_now", parsha_name=parsha_name)
-        await query.edit_message_text(text)
+        try:
+            text = await generate_parsha_text(
+                settings,
+                mode="onboarding_now",
+                parsha_name=parsha_name
+            )
+            await query.edit_message_text(text)
+        except Exception as e:
+            logger.exception(f"OpenAI error: {e}")
+            await query.edit_message_text(
+                "Онбординг завершён! Но произошла ошибка при генерации текста.\n"
+                "Попробуй команду /parsha немного позже."
+            )
         return
 
 
