@@ -351,4 +351,343 @@ async def parsha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала введи /start, чтобы настроить бота.")
         return
 
-    parsha_name = get_current_pa_
+    parsha_name = get_current_parsha()
+    text = await generate_parsha_text(settings, mode="manual_parsha", parsha_name=parsha_name)
+    await update.message.reply_text(text)
+
+
+# ---------- CALLBACK-КНОПКИ ОНБОРДИНГА ----------
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+    logger.info(f"Callback from {user_id}: {data}")
+
+    settings = USER_SETTINGS.get(user_id)
+    if not settings:
+        USER_SETTINGS[user_id] = UserSettings(user_id=user_id)
+        settings = USER_SETTINGS[user_id]
+
+    chat = query.message.chat
+
+    # выбор языка
+    if data == "lang_ru":
+        settings.language = Language.RU
+        text = (
+            "Язык: русский.\n\n"
+            "Теперь выбери, когда тебе удобнее получать сообщения:\n\n"
+            "☀️ Утром\n🌤 Днем\n🌇 Вечером\n🔄 Не важно\n\n"
+            "Это можно изменить в будущем."
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("☀️ Утром", callback_data="time_morning"),
+                InlineKeyboardButton("🌤 Днем", callback_data="time_day"),
+            ],
+            [
+                InlineKeyboardButton("🌇 Вечером", callback_data="time_evening"),
+                InlineKeyboardButton("🔄 Не важно", callback_data="time_anytime"),
+            ],
+        ]
+        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "lang_en":
+        settings.language = Language.EN
+        text = (
+            "Language set to English.\n\n"
+            "Now choose when you prefer to receive the messages:\n\n"
+            "☀️ Morning\n🌤 Day\n🌇 Evening\n🔄 Any time\n\n"
+            "You can change this later."
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("☀️ Morning", callback_data="time_morning"),
+                InlineKeyboardButton("🌤 Day", callback_data="time_day"),
+            ],
+            [
+                InlineKeyboardButton("🌇 Evening", callback_data="time_evening"),
+                InlineKeyboardButton("🔄 Any time", callback_data="time_anytime"),
+            ],
+        ]
+        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # выбор времени
+    if data.startswith("time_"):
+        mapping = {
+            "time_morning": SendTime.MORNING,
+            "time_day": SendTime.DAY,
+            "time_evening": SendTime.EVENING,
+            "time_anytime": SendTime.ANYTIME,
+        }
+        settings.send_time = mapping[data]
+
+        if settings.language == Language.RU:
+            text = (
+                "Теперь выбери свой часовой пояс, чтобы сообщения приходили в твое местное время.\n\n"
+                "Если не видишь нужный вариант — нажми «📍 Другое» и напиши, например: Europe/Berlin или America/New_York."
+            )
+            keyboard = [
+                [
+                    InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem"),
+                ],
+                [
+                    InlineKeyboardButton("🇷🇺 Moscow (Europe/Moscow)", callback_data="tz_Europe/Moscow"),
+                ],
+                [
+                    InlineKeyboardButton("🇩🇪 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin"),
+                ],
+                [
+                    InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai"),
+                ],
+                [
+                    InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York"),
+                ],
+                [
+                    InlineKeyboardButton("📍 Другое", callback_data="tz_custom"),
+                ],
+            ]
+        else:
+            text = (
+                "Now choose your time zone so that messages arrive in your local time.\n\n"
+                "If you do not see your option — tap “📍 Other” and send something like: Europe/Berlin or America/New_York."
+            )
+            keyboard = [
+                [
+                    InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem"),
+                ],
+                [
+                    InlineKeyboardButton("🇪🇺 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin"),
+                ],
+                [
+                    InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai"),
+                ],
+                [
+                    InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York"),
+                ],
+                [
+                    InlineKeyboardButton("📍 Other", callback_data="tz_custom"),
+                ],
+            ]
+
+        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # выбор часового пояса из списка
+    if data.startswith("tz_") and data != "tz_custom":
+        tz_name = data.removeprefix("tz_")
+        try:
+            ZoneInfo(tz_name)
+            settings.timezone = tz_name
+        except Exception:
+            settings.timezone = "Asia/Dubai"
+
+        if settings.language == Language.RU:
+            text = (
+                "Выбери, насколько ты знаком(а) с недельными главами:\n\n"
+                "1) «Мало интересовался, хочу понимать»\n"
+                "2) «Слышал, знаю немного, но не углублялся»\n"
+                "3) «Знаком с основами, хочу структурнее»\n\n"
+                "Это можно изменить в любой момент 🙂"
+            )
+        else:
+            text = (
+                "Choose your familiarity level with the weekly Torah portion:\n\n"
+                "1) “I have not really studied, I just want to understand the basics”\n"
+                "2) “I have heard things, I know a bit but not deeply”\n"
+                "3) “I know the basics and want more structure”\n\n"
+                "You can change this anytime 🙂"
+            )
+        keyboard = [
+            [
+                InlineKeyboardButton("1️⃣", callback_data="level_1"),
+                InlineKeyboardButton("2️⃣", callback_data="level_2"),
+                InlineKeyboardButton("3️⃣", callback_data="level_3"),
+            ]
+        ]
+        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # пользователь выбрал "другое" — просим ввести текстом
+    if data == "tz_custom":
+        TIMEZONE_AWAIT_USERS.add(user_id)
+        if settings.language == Language.RU:
+            await chat.send_message(
+                "Напиши свой часовой пояс текстом, например: Europe/Berlin, Asia/Jerusalem, America/New_York."
+            )
+        else:
+            await chat.send_message(
+                "Please type your time zone, for example: Europe/Berlin, Asia/Jerusalem, America/New_York."
+            )
+        return
+
+    # выбор уровня
+    if data.startswith("level_"):
+        mapping = {
+            "level_1": KnowledgeLevel.LEVEL1,
+            "level_2": KnowledgeLevel.LEVEL2,
+            "level_3": KnowledgeLevel.LEVEL3,
+        }
+        settings.level = mapping[data]
+
+        if settings.language == Language.RU:
+            text = (
+                "Как тебе было бы комфортнее получать объяснения недельных глав?\n\n"
+                "🧑‍🤝‍🧑 Как другу\n"
+                "— Я объясняю простым разговорным языком, без лишних формальностей.\n"
+                "Пример: «Смотри, в этой главе происходит вот что… и вот почему это важно».\n\n"
+                "📖 Как рассказ\n"
+                "— Плавно, спокойно, как короткую историю.\n"
+                "Пример: «Глава начинается с того, что… шаг за шагом события раскрывают идею».\n\n"
+                "📌 Как раввин\n"
+                "— По пунктам и структурно, но простым языком.\n"
+                "Пример: «1) Сначала происходит это. 2) Затем — это. 3) А смысл такой».\n\n"
+                "Выбери стиль — его можно поменять в любой момент 😊"
+            )
+        else:
+            text = (
+                "How would you like me to explain the weekly portions?\n\n"
+                "🧑‍🤝‍🧑 Like a friend\n"
+                "— Warm, simple, conversational.\n"
+                "Example: “So here’s what’s happening in this week’s portion, and why it matters.”\n\n"
+                "📖 Like a story\n"
+                "— Smooth and narrative, like a short chapter.\n"
+                "Example: “The portion opens with… and step by step the story reveals its idea.”\n\n"
+                "📌 Like a rabbi\n"
+                "— Structured and clear, but easy to understand.\n"
+                "Example: “1) This happens first. 2) Then this. 3) And here is the idea.”\n\n"
+                "Choose the style — you can change it anytime 😊"
+            )
+        keyboard = [
+            [
+                InlineKeyboardButton("Как другу / Friend", callback_data="style_friend"),
+            ],
+            [
+                InlineKeyboardButton("Как рассказ / Story", callback_data="style_story"),
+            ],
+            [
+                InlineKeyboardButton("Как раввин / Rabbi", callback_data="style_rabbi"),
+            ],
+        ]
+        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # выбор стиля — завершение онбординга
+    if data.startswith("style_"):
+        mapping = {
+            "style_friend": Style.FRIEND,
+            "style_story": Style.STORY,
+            "style_rabbi": Style.RABBI,
+        }
+        settings.style = mapping.get(data, Style.FRIEND)
+
+        # создаём персональное расписание
+        try:
+            schedule_jobs_for_user(context.application, settings)
+        except Exception as e:
+            logger.exception(f"Scheduler error: {e}")
+            await chat.send_message(
+                "Онбординг почти готов. Возникла ошибка при настройке расписания, но бот всё равно работает.\n"
+                "Если что — ты всегда можешь получить главу командой /parsha."
+            )
+            return
+
+        # отправляем объяснение текущей главы
+        parsha_name = get_current_parsha()
+        try:
+            text = await generate_parsha_text(
+                settings,
+                mode="onboarding_now",
+                parsha_name=parsha_name
+            )
+            await chat.send_message(text)
+        except Exception as e:
+            logger.exception(f"OpenAI error: {e}")
+            await chat.send_message(
+                "Онбординг завершён! Но произошла ошибка при генерации текста.\n"
+                "Попробуй команду /parsha немного позже."
+            )
+        return
+
+
+# ---------- ВВОД TIMEZONE ТЕКСТОМ ----------
+
+async def timezone_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in TIMEZONE_AWAIT_USERS:
+        return
+
+    tz_text = (update.message.text or "").strip()
+    settings = USER_SETTINGS.get(user_id)
+    if not settings:
+        TIMEZONE_AWAIT_USERS.discard(user_id)
+        await update.message.reply_text("Сначала введи /start.")
+        return
+
+    try:
+        ZoneInfo(tz_text)
+        settings.timezone = tz_text
+        TIMEZONE_AWAIT_USERS.discard(user_id)
+    except Exception:
+        if settings.language == Language.RU:
+            await update.message.reply_text(
+                "Не смог распознать часовой пояс. Попробуй еще раз, например: Europe/Berlin или America/New_York."
+            )
+        else:
+            await update.message.reply_text(
+                "I could not recognize this time zone. Please try again, e.g. Europe/Berlin or America/New_York."
+            )
+        return
+
+    # продолжение онбординга (выбор уровня)
+    if settings.language == Language.RU:
+        text = (
+            "Отлично! Теперь выбери, насколько ты знаком(а) с недельными главами:\n\n"
+            "1) «Мало интересовался, хочу понимать»\n"
+            "2) «Слышал, знаю немного, но не углублялся»\n"
+            "3) «Знаком с основами, хочу структурнее»\n\n"
+            "Это можно изменить в любой момент 🙂"
+        )
+    else:
+        text = (
+            "Great! Now choose your familiarity level with the weekly Torah portion:\n\n"
+            "1) “I have not really studied, I just want to understand the basics”\n"
+            "2) “I have heard things, I know a bit but not deeply”\n"
+            "3) “I know the basics and want more structure”\n\n"
+            "You can change this anytime 🙂"
+        )
+    keyboard = [
+        [
+            InlineKeyboardButton("1️⃣", callback_data="level_1"),
+            InlineKeyboardButton("2️⃣", callback_data="level_2"),
+            InlineKeyboardButton("3️⃣", callback_data="level_3"),
+        ]
+    ]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ---------- MAIN ----------
+
+def main():
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
+
+    application = ApplicationBuilder().token(token).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("parsha", parsha_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, timezone_text_handler))
+
+    scheduler.start()
+    logger.info("Bot started")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
