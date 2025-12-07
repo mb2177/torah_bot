@@ -24,6 +24,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.job import Job
 
 from openai import AsyncOpenAI
+from openai import APITimeoutError, APIError
 
 # ---------- ЛОГИ ----------
 
@@ -35,7 +36,12 @@ logger = logging.getLogger(__name__)
 # ---------- OPENAI КЛИЕНТ ----------
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1-mini")
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY is not set. Bot will not be able to generate texts.")
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = """
 Ты - ассистент, который объясняет недельные главы Торы простым человеческим языком.
@@ -100,10 +106,10 @@ class Style(str, Enum):
 
 
 class SendTime(str, Enum):
-    MORNING = "morning"
-    DAY = "day"
-    EVENING = "evening"
-    ANYTIME = "anytime"
+    MORNING = "morning"   # 9:00
+    DAY = "day"           # 13:00
+    EVENING = "evening"   # 20:00
+    ANYTIME = "anytime"   # 12:00
 
 
 class UserSettings:
@@ -122,7 +128,6 @@ class UserSettings:
         self.style = style
         self.send_time = send_time
         self.timezone = timezone
-        # id задач в планировщике
         self.job_ids: Dict[str, str] = {}
 
     def __repr__(self) -> str:
@@ -141,7 +146,6 @@ TIMEZONE_AWAIT_USERS: set[int] = set()
 
 scheduler = AsyncIOScheduler()
 
-
 def map_send_time_to_hour_minute(send_time: SendTime) -> Tuple[int, int]:
     if send_time == SendTime.MORNING:
         return 9, 0
@@ -151,13 +155,11 @@ def map_send_time_to_hour_minute(send_time: SendTime) -> Tuple[int, int]:
         return 20, 0
     return 12, 0  # ANYTIME
 
-
-# ---------- ЗАГЛУШКА НАЗВАНИЯ ГЛАВЫ ----------
+# ---------- ГЛАВА (ПОКА ЗАГЛУШКА) ----------
 
 def get_current_parsha() -> str:
-    # TODO: реальный календарь
+    # TODO: сюда потом подключим реальный календарь
     return "Vayishlach"
-
 
 # ---------- ГЕНЕРАЦИЯ ТЕКСТА ----------
 
@@ -215,6 +217,13 @@ async def generate_parsha_text(
     mode: str,
     parsha_name: Optional[str] = None,
 ) -> str:
+    if not OPENAI_API_KEY:
+        # fallback если забыли ключ
+        if settings.language == Language.RU:
+            return "Сейчас генерация текста временно недоступна (нет ключа OpenAI)."
+        else:
+            return "Text generation is temporarily unavailable (no OpenAI API key set)."
+
     if parsha_name is None:
         parsha_name = get_current_parsha()
 
@@ -226,18 +235,31 @@ async def generate_parsha_text(
         mode=mode,
     )
 
-    resp = await client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.7,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.7,
+            timeout=30,  # ограничиваем, чтобы не висело вечно
+        )
+        return resp.choices[0].message.content.strip()
+    except (APITimeoutError, APIError) as e:
+        logger.exception(f"OpenAI API error: {e}")
+        if settings.language == Language.RU:
+            return "Сейчас не удалось получить ответ от модели. Попробуй еще раз чуть позже."
+        else:
+            return "The model did not respond in time. Please try again a bit later."
+    except Exception as e:
+        logger.exception(f"Unexpected OpenAI error: {e}")
+        if settings.language == Language.RU:
+            return "Произошла техническая ошибка при генерации текста."
+        else:
+            return "A technical error occurred while generating the text."
 
-
-# ---------- РАССЫЛКИ ДЛЯ ОДНОГО ПОЛЬЗОВАТЕЛЯ ----------
+# ---------- ФУНКЦИИ РАССЫЛКИ ----------
 
 async def send_sunday_parsha_for_user(bot, user_id: int):
     settings = USER_SETTINGS.get(user_id)
@@ -276,6 +298,7 @@ async def send_friday_toast_for_user(bot, user_id: int):
 
 
 def schedule_jobs_for_user(application: Application, settings: UserSettings):
+    # убрать старые задачи
     for job_id in settings.job_ids.values():
         try:
             scheduler.remove_job(job_id)
@@ -313,7 +336,6 @@ def schedule_jobs_for_user(application: Application, settings: UserSettings):
         "friday": job_fri.id,
     }
     logger.info(f"Scheduled jobs for user {settings.user_id}: {settings.job_ids}")
-
 
 # ---------- КОМАНДЫ ----------
 
@@ -355,8 +377,7 @@ async def parsha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await generate_parsha_text(settings, mode="manual_parsha", parsha_name=parsha_name)
     await update.message.reply_text(text)
 
-
-# ---------- CALLBACK-КНОПКИ ОНБОРДИНГА ----------
+# ---------- CALLBACK ОНБОРДИНГА ----------
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -589,29 +610,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_jobs_for_user(context.application, settings)
         except Exception as e:
             logger.exception(f"Scheduler error: {e}")
-            await chat.send_message(
-                "Онбординг почти готов. Возникла ошибка при настройке расписания, но бот всё равно работает.\n"
-                "Если что — ты всегда можешь получить главу командой /parsha."
-            )
+            if settings.language == Language.RU:
+                await chat.send_message(
+                    "Онбординг почти завершён. Возникла ошибка при настройке расписания, "
+                    "но ты всё равно можешь получать главу командой /parsha."
+                )
+            else:
+                await chat.send_message(
+                    "Onboarding is almost done. There was an error while setting up the schedule, "
+                    "but you can still get the portion with /parsha."
+                )
             return
 
         # отправляем объяснение текущей главы
         parsha_name = get_current_parsha()
-        try:
-            text = await generate_parsha_text(
-                settings,
-                mode="onboarding_now",
-                parsha_name=parsha_name
-            )
-            await chat.send_message(text)
-        except Exception as e:
-            logger.exception(f"OpenAI error: {e}")
-            await chat.send_message(
-                "Онбординг завершён! Но произошла ошибка при генерации текста.\n"
-                "Попробуй команду /parsha немного позже."
-            )
+        text = await generate_parsha_text(
+            settings,
+            mode="onboarding_now",
+            parsha_name=parsha_name
+        )
+        await chat.send_message(text)
         return
-
 
 # ---------- ВВОД TIMEZONE ТЕКСТОМ ----------
 
@@ -642,7 +661,7 @@ async def timezone_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
             )
         return
 
-    # продолжение онбординга (выбор уровня)
+    # продолжаем онбординг — выбор уровня
     if settings.language == Language.RU:
         text = (
             "Отлично! Теперь выбери, насколько ты знаком(а) с недельными главами:\n\n"
@@ -668,7 +687,6 @@ async def timezone_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-
 # ---------- MAIN ----------
 
 def main():
@@ -686,7 +704,10 @@ def main():
 
     scheduler.start()
     logger.info("Bot started")
-    application.run_polling()
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=1.0,
+    )
 
 
 if __name__ == "__main__":
