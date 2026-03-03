@@ -1,755 +1,239 @@
 import os
+import asyncio
 import logging
-from enum import Enum
-from typing import Dict, Tuple, Optional
+import httpx
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-)
+from telegram import Update, BotCommand
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
 )
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.job import Job
 
 from openai import AsyncOpenAI
 
-# ---------- ЛОГИ ----------
+# ---------------- ЛОГИ ----------------
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- OPENAI ----------
+# ---------------- НАСТРОЙКИ ----------------
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN not set")
+
 if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set. Generation will not work.")
+    raise RuntimeError("OPENAI_API_KEY not set")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+# ---------------- SYSTEM PROMPT ----------------
+
 SYSTEM_PROMPT = """
-Ты - ассистент, который объясняет недельные главы Торы простым человеческим языком.
+Ты раввин и преподаватель Торы.
 
-ЖЕСТКИЕ ПРАВИЛА ТОЧНОСТИ:
-- Не придумывай событий, которых нет в Торе.
-- Не меняй порядок событий внутри главы.
-- Не добавляй персонажей.
-- Не смешивай главы между собой.
-- Не цитируй Тору дословно.
-- Не пиши галахические законы.
-- Не давай религиозные предписания.
-- Не используй каббалу.
-- Не используй редкие спорные мнения.
-Если ты не уверен, опиши только то, что достоверно известно и общепринято.
+Ты получаешь STRUCTURE — это список событий главы в правильном порядке.
+Ты НЕ имеешь права добавлять события вне STRUCTURE.
+Ты НЕ имеешь права менять порядок.
+Ты НЕ имеешь права добавлять диалоги.
+Ты НЕ имеешь права цитировать Тору дословно.
+Ты НЕ имеешь права писать галаху.
+Ты НЕ имеешь права использовать каббалу.
+Ты НЕ имеешь права давить морально.
 
-СТРУКТУРА ЛЮБОГО ОТВЕТА:
-1) Факты (60-75% текста) - точный пересказ событий недельной главы без лишних деталей.
-2) Мягкий традиционный смысл (15-25%) - простое объяснение идеи главы, без терминов и споров.
-3) Современное объяснение (5-10%) - человеческий язык, легкие примеры, без морализаторства и давления.
+Формат ответа:
+1) Структурный пересказ событий главы (по пунктам, строго по STRUCTURE)
+2) Мягкое объяснение того, что обычно в этом видят комментаторы
+3) Короткая современная мысль
 
-СТИЛИ:
-- friend - живо, как другу, но без грубого сленга.
-- story - плавно, как рассказ.
-- rabbi - структурно, по пунктам, но простым языком.
-
-УРОВНИ:
-- level 1 - минимум деталей, максимум понятности.
-- level 2 - больше логики и связей.
-- level 3 - структурное объяснение и мягкие комментарии.
-
-ТОН:
-- спокойный, уважительный, теплый.
-- без проповедей, без давления, без сравнения религий, без политики.
-
-ТЫ ВСЕГДА УЧИТЫВАЕШЬ:
-- язык (ru или en),
-- уровень (1-3),
-- стиль (friend/story/rabbi),
-- тип сообщения (воскресное объяснение, середина недели, пятничная фраза, онбординг).
-
-Не пиши ничего про правила и инструкции, отвечай только конечным текстом для пользователя.
+Пиши только по-русски.
+Пиши ясно, структурно, уверенно, как раввин.
 """
 
-# ---------- МОДЕЛИ ДАННЫХ ----------
+# ---------------- HELPER: typing ----------------
 
-class Language(str, Enum):
-    RU = "ru"
-    EN = "en"
-
-
-class KnowledgeLevel(int, Enum):
-    LEVEL1 = 1
-    LEVEL2 = 2
-    LEVEL3 = 3
-
-
-class Style(str, Enum):
-    FRIEND = "friend"
-    STORY = "story"
-    RABBI = "rabbi"
-
-
-class SendTime(str, Enum):
-    MORNING = "morning"   # 9:00
-    DAY = "day"           # 13:00
-    EVENING = "evening"   # 20:00
-    ANYTIME = "anytime"   # 12:00
-
-
-class UserSettings:
-    def __init__(
-        self,
-        user_id: int,
-        language: Language = Language.RU,
-        level: KnowledgeLevel = KnowledgeLevel.LEVEL1,
-        style: Style = Style.FRIEND,
-        send_time: SendTime = SendTime.ANYTIME,
-        timezone: str = "Asia/Dubai",
-    ):
-        self.user_id = user_id
-        self.language = language
-        self.level = level
-        self.style = style
-        self.send_time = send_time
-        self.timezone = timezone
-        self.job_ids: Dict[str, str] = {}
-
-    def __repr__(self) -> str:
-        return (
-            f"UserSettings(user_id={self.user_id}, "
-            f"language={self.language}, level={self.level}, "
-            f"style={self.style}, send_time={self.send_time}, "
-            f"timezone='{self.timezone}', job_ids={self.job_ids})"
-        )
-
-
-USER_SETTINGS: Dict[int, UserSettings] = {}
-TIMEZONE_AWAIT_USERS: set[int] = set()
-
-# ---------- APSCHEDULER ----------
-
-scheduler = AsyncIOScheduler()
-
-
-def map_send_time_to_hour_minute(send_time: SendTime) -> Tuple[int, int]:
-    if send_time == SendTime.MORNING:
-        return 9, 0
-    if send_time == SendTime.DAY:
-        return 13, 0
-    if send_time == SendTime.EVENING:
-        return 20, 0
-    return 12, 0  # ANYTIME
-
-
-# ---------- ПАРША (пока заглушка) ----------
-
-def get_current_parsha() -> str:
-    # TODO: заменить на реальный календарь
-    return "Vayishlach"
-
-
-# ---------- PROMPT ДЛЯ OPENAI ----------
-
-def build_user_prompt(
-    language: str,
-    level: int,
-    style: str,
-    parsha_name: str,
-    mode: str,
-) -> str:
-    if language == "ru":
-        lang_prefix = "Пиши по-русски."
-    else:
-        lang_prefix = "Write in clear, simple English."
-
-    if mode == "sunday_main":
-        core = (
-            "Сделай основное объяснение недельной главы."
-            " Сначала коротко расскажи события главы, затем мягко объясни смысл,"
-            " и в конце добавь современное человеческое объяснение."
-        )
-    elif mode == "midweek_detail":
-        core = (
-            "Выбери один интересный момент из этой недельной главы и объясни его."
-            " Покажи, чем он важен, и добавь мягкую человеческую мысль."
-        )
-    elif mode == "friday_toast":
-        core = (
-            "Сделай текст строго из трех предложений. "
-            "1) Напомни один момент из главы. "
-            "2) Дай простую теплую мудрость. "
-            "3) Сформулируй фразу, которую можно сказать семье или друзьям за столом."
-        )
-    elif mode == "onboarding_now":
-        core = (
-            "Сначала одной фразой скажи, что обычно объяснение приходит по воскресеньям,"
-            " но сейчас ты отправляешь объяснение текущей главы, чтобы человек не пропустил неделю."
-            " Потом сделай объяснение главы так же, как в воскресной версии."
-        )
-    else:
-        core = "Сделай объяснение недельной главы так же, как в воскресной версии."
-
-    return (
-        f"{lang_prefix}\n"
-        f"Недельная глава: {parsha_name}.\n"
-        f"Уровень знания: {level}.\n"
-        f"Стиль: {style}.\n"
-        f"Тип сообщения: {mode}.\n"
-        f"{core}"
-    )
-
-
-# ---------- ГЕНЕРАЦИЯ ТЕКСТА С GPT-5 + FALLBACK ----------
-
-async def generate_parsha_text(
-    settings: UserSettings,
-    mode: str,
-    parsha_name: Optional[str] = None,
-) -> str:
-    if not OPENAI_API_KEY:
-        if settings.language == Language.RU:
-            return "Генерация текста сейчас недоступна (не задан ключ OpenAI)."
-        else:
-            return "Text generation is unavailable right now (no OpenAI API key set)."
-
-    if parsha_name is None:
-        parsha_name = get_current_parsha()
-
-    user_prompt = build_user_prompt(
-        language=settings.language.value,
-        level=int(settings.level),
-        style=settings.style.value,
-        parsha_name=parsha_name,
-        mode=mode,
-    )
-
-    # Пытаемся по очереди: GPT-5 mini → GPT-5 → GPT-4 mini
-    preferred_models = [
-        "gpt-5.1-mini",
-        "gpt-5.1",
-        "gpt-4.1-mini",
-    ]
-
-    last_error: Optional[Exception] = None
-
-    for model_name in preferred_models:
+async def send_typing(chat, duration=15):
+    for _ in range(duration * 2):
         try:
-            resp = await client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.7,
-                timeout=25,
-            )
-            logger.info(f"Used model: {model_name}")
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning(f"Model {model_name} failed: {e}")
-            last_error = e
-            continue
-
-    logger.error(f"All models failed: {last_error}")
-    if settings.language == Language.RU:
-        return "Сейчас не удалось получить ответ от модели. Попробуй ещё раз немного позже."
-    else:
-        return "All models failed to respond. Please try again later."
-
-
-# ---------- ФУНКЦИИ РАССЫЛКИ ----------
-
-async def send_sunday_parsha_for_user(bot, user_id: int):
-    settings = USER_SETTINGS.get(user_id)
-    if not settings:
-        return
-    try:
-        parsha_name = get_current_parsha()
-        text = await generate_parsha_text(settings, mode="sunday_main", parsha_name=parsha_name)
-        await bot.send_message(chat_id=user_id, text=text)
-    except Exception as e:
-        logger.exception(f"Error sending sunday parsha to {user_id}: {e}")
-
-
-async def send_midweek_detail_for_user(bot, user_id: int):
-    settings = USER_SETTINGS.get(user_id)
-    if not settings:
-        return
-    try:
-        parsha_name = get_current_parsha()
-        text = await generate_parsha_text(settings, mode="midweek_detail", parsha_name=parsha_name)
-        await bot.send_message(chat_id=user_id, text=text)
-    except Exception as e:
-        logger.exception(f"Error sending midweek detail to {user_id}: {e}")
-
-
-async def send_friday_toast_for_user(bot, user_id: int):
-    settings = USER_SETTINGS.get(user_id)
-    if not settings:
-        return
-    try:
-        parsha_name = get_current_parsha()
-        text = await generate_parsha_text(settings, mode="friday_toast", parsha_name=parsha_name)
-        await bot.send_message(chat_id=user_id, text=text)
-    except Exception as e:
-        logger.exception(f"Error sending friday toast to {user_id}: {e}")
-
-
-def schedule_jobs_for_user(application: Application, settings: UserSettings):
-    # удаляем старые задачи
-    for job_id in settings.job_ids.values():
-        try:
-            scheduler.remove_job(job_id)
-        except Exception:
+            await chat.send_chat_action("typing")
+        except:
             pass
-    settings.job_ids = {}
+        await asyncio.sleep(0.5)
 
-    hour, minute = map_send_time_to_hour_minute(settings.send_time)
+# ---------------- HEBcal: текущая парша (Diaspora) ----------------
 
-    try:
-        tz = ZoneInfo(settings.timezone)
-    except Exception:
-        tz = ZoneInfo("Asia/Dubai")
-        settings.timezone = "Asia/Dubai"
-
-    job_sun: Job = scheduler.add_job(
-        send_sunday_parsha_for_user,
-        trigger=CronTrigger(day_of_week="sun", hour=hour, minute=minute, timezone=tz),
-        args=[application.bot, settings.user_id],
-    )
-    job_mid: Job = scheduler.add_job(
-        send_midweek_detail_for_user,
-        trigger=CronTrigger(day_of_week="wed", hour=hour, minute=minute, timezone=tz),
-        args=[application.bot, settings.user_id],
-    )
-    job_fri: Job = scheduler.add_job(
-        send_friday_toast_for_user,
-        trigger=CronTrigger(day_of_week="fri", hour=hour, minute=minute, timezone=tz),
-        args=[application.bot, settings.user_id],
-    )
-
-    settings.job_ids = {
-        "sunday": job_sun.id,
-        "midweek": job_mid.id,
-        "friday": job_fri.id,
+async def get_current_parsha():
+    url = "https://www.hebcal.com/hebcal"
+    params = {
+        "v": "1",
+        "cfg": "json",
+        "maj": "on",
+        "min": "on",
+        "mod": "on",
+        "nx": "on",
+        "year": "now",
+        "month": "x",
+        "ss": "on",
+        # НЕТ i=on → значит Diaspora
     }
-    logger.info(f"Scheduled jobs for user {settings.user_id}: {settings.job_ids}")
 
+    async with httpx.AsyncClient() as client_http:
+        r = await client_http.get(url, params=params)
+        data = r.json()
 
-# ---------- КОМАНДЫ ----------
+    for item in data.get("items", []):
+        if item.get("category") == "parashat":
+            return item.get("title")
+
+    return None
+
+# ---------------- Sefaria: получить текст главы ----------------
+
+async def get_parsha_text(parsha_name):
+    ref = f"Torah, {parsha_name}"
+    url = f"https://www.sefaria.org/api/texts/{ref}?lang=he&context=0"
+
+    async with httpx.AsyncClient(timeout=30) as client_http:
+        r = await client_http.get(url)
+        data = r.json()
+
+    # Возвращаем весь текст без форматирования
+    text = ""
+    if isinstance(data.get("text"), list):
+        for section in data["text"]:
+            if isinstance(section, list):
+                text += " ".join(section) + " "
+            else:
+                text += str(section) + " "
+    return text[:15000]  # ограничиваем размер
+
+# ---------------- ШАГ 1: извлечь структуру ----------------
+
+async def extract_structure(parsha_text):
+    prompt = f"""
+На основе следующего текста главы Торы выдели ТОЛЬКО структуру событий.
+Сделай список пунктов в правильном порядке.
+Без объяснений. Только события.
+
+Текст:
+{parsha_text}
+"""
+
+    response = await client.chat.completions.create(
+        model="gpt-5.1-mini",
+        messages=[
+            {"role": "system", "content": "Ты выделяешь только структуру событий."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+
+    return response.choices[0].message.content
+
+# ---------------- ШАГ 2: форматирование как раввин ----------------
+
+async def format_as_rabbi(structure_text):
+    prompt = f"""
+STRUCTURE:
+{structure_text}
+"""
+
+    response = await client.chat.completions.create(
+        model="gpt-5.1-mini",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.6,
+    )
+
+    return response.choices[0].message.content
+
+# ---------------- Telegram limit split ----------------
+
+def split_text(text, limit=4000):
+    parts = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        parts.append(text[:split_at])
+        text = text[split_at:]
+    parts.append(text)
+    return parts
+
+# ---------------- /start ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    USER_SETTINGS[user.id] = UserSettings(user_id=user.id)
-    logger.info(f"/start from {user.id}")
-
-    keyboard = [
-        [
-            InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
-            InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
-        ]
-    ]
     text = (
-        "Я объясняю недельную главу Торы простым языком — без терминов и без давления.\n\n"
-        "Для начала выбери язык:"
-    )
-    await update.effective_chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Этот бот помогает понимать недельные главы Торы простым языком.\n\n"
-        "/start — пройти настройку заново\n"
-        "/parsha — объяснение текущей недельной главы\n"
-        "/settings — показать твої настройки\n"
-        "/help — краткая помощь\n"
+        "Я объясняю недельную главу Торы структурно и точно.\n\n"
+        "Используй команду /parsha чтобы получить объяснение текущей главы."
     )
     await update.message.reply_text(text)
 
+# ---------------- /parsha ----------------
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    settings = USER_SETTINGS.get(user_id)
-    if not settings:
-        await update.message.reply_text("Сначала введи /start, чтобы настроить бота.")
-        return
+async def parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
 
-    if settings.language == Language.RU:
-        text = (
-            "Твои текущие настройки:\n\n"
-            f"• Язык: русский\n"
-            f"• Уровень: {int(settings.level)}\n"
-            f"• Стиль: {settings.style.value}\n"
-            f"• Время отправки: {settings.send_time.value}\n"
-            f"• Часовой пояс: {settings.timezone}\n\n"
-            "Пока менять настройки можно только через /start (полная перенастройка).\n"
-            "Позже добавим отдельные кнопки изменения."
-        )
-    else:
-        text = (
-            "Your current settings:\n\n"
-            f"• Language: English\n"
-            f"• Level: {int(settings.level)}\n"
-            f"• Style: {settings.style.value}\n"
-            f"• Send time: {settings.send_time.value}\n"
-            f"• Timezone: {settings.timezone}\n\n"
-            "For now, you can change settings only via /start (full onboarding again).\n"
-            "Later we will add separate change commands."
-        )
-
-    await update.message.reply_text(text)
-
-
-async def parsha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    settings = USER_SETTINGS.get(user_id)
-    if not settings:
-        await update.message.reply_text("Сначала введи /start, чтобы настроить бота.")
-        return
-
-    parsha_name = get_current_parsha()
-    text = await generate_parsha_text(settings, mode="manual_parsha", parsha_name=parsha_name)
-    await update.message.reply_text(text)
-
-
-# ---------- CALLBACK ОНБОРДИНГА ----------
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    logger.info(f"Callback from {user_id}: {data}")
-
-    settings = USER_SETTINGS.get(user_id)
-    if not settings:
-        USER_SETTINGS[user_id] = UserSettings(user_id=user_id)
-        settings = USER_SETTINGS[user_id]
-
-    chat = query.message.chat
-
-    # выбор языка
-    if data == "lang_ru":
-        settings.language = Language.RU
-        text = (
-            "Язык: русский.\n\n"
-            "Теперь выбери, когда тебе удобнее получать сообщения:\n\n"
-            "☀️ Утром\n🌤 Днем\n🌇 Вечером\n🔄 Не важно\n\n"
-            "Это можно изменить в будущем."
-        )
-        keyboard = [
-            [
-                InlineKeyboardButton("☀️ Утром", callback_data="time_morning"),
-                InlineKeyboardButton("🌤 Днем", callback_data="time_day"),
-            ],
-            [
-                InlineKeyboardButton("🌇 Вечером", callback_data="time_evening"),
-                InlineKeyboardButton("🔄 Не важно", callback_data="time_anytime"),
-            ],
-        ]
-        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data == "lang_en":
-        settings.language = Language.EN
-        text = (
-            "Language set to English.\n\n"
-            "Now choose when you prefer to receive the messages:\n\n"
-            "☀️ Morning\n🌤 Day\n🌇 Evening\n🔄 Any time\n\n"
-            "You can change this later."
-        )
-        keyboard = [
-            [
-                InlineKeyboardButton("☀️ Morning", callback_data="time_morning"),
-                InlineKeyboardButton("🌤 Day", callback_data="time_day"),
-            ],
-            [
-                InlineKeyboardButton("🌇 Evening", callback_data="time_evening"),
-                InlineKeyboardButton("🔄 Any time", callback_data="time_anytime"),
-            ],
-        ]
-        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # выбор времени
-    if data.startswith("time_"):
-        mapping = {
-            "time_morning": SendTime.MORNING,
-            "time_day": SendTime.DAY,
-            "time_evening": SendTime.EVENING,
-            "time_anytime": SendTime.ANYTIME,
-        }
-        settings.send_time = mapping[data]
-
-        if settings.language == Language.RU:
-            text = (
-                "Теперь выбери свой часовой пояс, чтобы сообщения приходили в твое местное время.\n\n"
-                "Если не видишь нужный вариант — нажми «📍 Другое» и напиши, например: Europe/Berlin или America/New_York."
-            )
-            keyboard = [
-                [InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem")],
-                [InlineKeyboardButton("🇷🇺 Moscow (Europe/Moscow)", callback_data="tz_Europe/Moscow")],
-                [InlineKeyboardButton("🇩🇪 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin")],
-                [InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai")],
-                [InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York")],
-                [InlineKeyboardButton("📍 Другое", callback_data="tz_custom")],
-            ]
-        else:
-            text = (
-                "Now choose your time zone so that messages arrive in your local time.\n\n"
-                "If you do not see your option — tap “📍 Other” and send something like: Europe/Berlin or America/New_York."
-            )
-            keyboard = [
-                [InlineKeyboardButton("🇮🇱 Israel (Asia/Jerusalem)", callback_data="tz_Asia/Jerusalem")],
-                [InlineKeyboardButton("🇪🇺 Europe (Europe/Berlin)", callback_data="tz_Europe/Berlin")],
-                [InlineKeyboardButton("🇦🇪 Dubai (Asia/Dubai)", callback_data="tz_Asia/Dubai")],
-                [InlineKeyboardButton("🇺🇸 New York (America/New_York)", callback_data="tz_America/New_York")],
-                [InlineKeyboardButton("📍 Other", callback_data="tz_custom")],
-            ]
-
-        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # выбор часового пояса из списка
-    if data.startswith("tz_") and data != "tz_custom":
-        tz_name = data.removeprefix("tz_")
-        try:
-            ZoneInfo(tz_name)
-            settings.timezone = tz_name
-        except Exception:
-            settings.timezone = "Asia/Dubai"
-
-        if settings.language == Language.RU:
-            text = (
-                "Выбери, насколько ты знаком(а) с недельными главами:\n\n"
-                "1) «Мало интересовался, хочу понимать»\n"
-                "2) «Слышал, знаю немного, но не углублялся»\n"
-                "3) «Знаком с основами, хочу структурнее»\n\n"
-                "Это можно изменить в любой момент 🙂"
-            )
-        else:
-            text = (
-                "Choose your familiarity level with the weekly Torah portion:\n\n"
-                "1) “I have not really studied, I just want to understand the basics”\n"
-                "2) “I have heard things, I know a bit but not deeply”\n"
-                "3) “I know the basics and want more structure”\n\n"
-                "You can change this anytime 🙂"
-            )
-        keyboard = [
-            [
-                InlineKeyboardButton("1️⃣", callback_data="level_1"),
-                InlineKeyboardButton("2️⃣", callback_data="level_2"),
-                InlineKeyboardButton("3️⃣", callback_data="level_3"),
-            ]
-        ]
-        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # пользователь выбрал "другое" — просим ввести текстом
-    if data == "tz_custom":
-        TIMEZONE_AWAIT_USERS.add(user_id)
-        if settings.language == Language.RU:
-            await chat.send_message(
-                "Напиши свой часовой пояс текстом, например: Europe/Berlin, Asia/Jerusalem, America/New_York."
-            )
-        else:
-            await chat.send_message(
-                "Please type your time zone, for example: Europe/Berlin, Asia/Jerusalem, America/New_York."
-            )
-        return
-
-    # выбор уровня
-    if data.startswith("level_"):
-        mapping = {
-            "level_1": KnowledgeLevel.LEVEL1,
-            "level_2": KnowledgeLevel.LEVEL2,
-            "level_3": KnowledgeLevel.LEVEL3,
-        }
-        settings.level = mapping[data]
-
-        if settings.language == Language.RU:
-            text = (
-                "Как тебе было бы комфортнее получать объяснения недельных глав?\n\n"
-                "🧑‍🤝‍🧑 Как другу\n"
-                "— Я объясняю простым разговорным языком, без лишних формальностей.\n"
-                "Пример: «Смотри, в этой главе происходит вот что… и вот почему это важно».\n\n"
-                "📖 Как рассказ\n"
-                "— Плавно, спокойно, как короткую историю.\n"
-                "Пример: «Глава начинается с того, что… шаг за шагом события раскрывают идею».\n\n"
-                "📌 Как раввин\n"
-                "— По пунктам и структурно, но простым языком.\n"
-                "Пример: «1) Сначала происходит это. 2) Затем — это. 3) А смысл такой».\n\n"
-                "Выбери стиль — его можно поменять в любой момент 😊"
-            )
-        else:
-            text = (
-                "How would you like me to explain the weekly portions?\n\n"
-                "🧑‍🤝‍🧑 Like a friend\n"
-                "— Warm, simple, conversational.\n"
-                "Example: “So here’s what’s happening in this week’s portion, and why it matters.”\n\n"
-                "📖 Like a story\n"
-                "— Smooth and narrative, like a short chapter.\n"
-                "Example: “The portion opens with… and step by step the story reveals its idea.”\n\n"
-                "📌 Like a rabbi\n"
-                "— Structured and clear, but easy to understand.\n"
-                "Example: “1) This happens first. 2) Then this. 3) And here is the idea.”\n\n"
-                "Choose the style — you can change it anytime 😊"
-            )
-        keyboard = [
-            [InlineKeyboardButton("Как другу / Friend", callback_data="style_friend")],
-            [InlineKeyboardButton("Как рассказ / Story", callback_data="style_story")],
-            [InlineKeyboardButton("Как раввин / Rabbi", callback_data="style_rabbi")],
-        ]
-        await chat.send_message(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # выбор стиля — завершение онбординга
-    if data.startswith("style_"):
-        mapping = {
-            "style_friend": Style.FRIEND,
-            "style_story": Style.STORY,
-            "style_rabbi": Style.RABBI,
-        }
-        settings.style = mapping.get(data, Style.FRIEND)
-
-        # создаём персональное расписание
-        try:
-            schedule_jobs_for_user(context.application, settings)
-        except Exception as e:
-            logger.exception(f"Scheduler error: {e}")
-            if settings.language == Language.RU:
-                await chat.send_message(
-                    "Онбординг почти завершён. Возникла ошибка при настройке расписания, "
-                    "но ты всё равно можешь получать главу командой /parsha."
-                )
-            else:
-                await chat.send_message(
-                    "Onboarding is almost done. There was an error while setting up the schedule, "
-                    "but you can still get the portion with /parsha."
-                )
-            return
-
-        # отправляем объяснение текущей главы
-        parsha_name = get_current_parsha()
-        text = await generate_parsha_text(
-            settings,
-            mode="onboarding_now",
-            parsha_name=parsha_name,
-        )
-        await chat.send_message(text)
-        return
-
-
-# ---------- ВВОД TIMEZONE ТЕКСТОМ ----------
-
-async def timezone_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in TIMEZONE_AWAIT_USERS:
-        return
-
-    tz_text = (update.message.text or "").strip()
-    settings = USER_SETTINGS.get(user_id)
-    if not settings:
-        TIMEZONE_AWAIT_USERS.discard(user_id)
-        await update.message.reply_text("Сначала введи /start.")
-        return
+    typing_task = asyncio.create_task(send_typing(chat))
 
     try:
-        ZoneInfo(tz_text)
-        settings.timezone = tz_text
-        TIMEZONE_AWAIT_USERS.discard(user_id)
-    except Exception:
-        if settings.language == Language.RU:
-            await update.message.reply_text(
-                "Не смог распознать часовой пояс. Попробуй еще раз, например: Europe/Berlin или America/New_York."
-            )
-        else:
-            await update.message.reply_text(
-                "I could not recognize this time zone. Please try again, e.g. Europe/Berlin or America/New_York."
-            )
-        return
+        parsha_name = await get_current_parsha()
+        if not parsha_name:
+            await chat.send_message("Не удалось определить текущую главу.")
+            return
 
-    # продолжаем онбординг — выбор уровня
-    if settings.language == Language.RU:
-        text = (
-            "Отлично! Теперь выбери, насколько ты знаком(а) с недельными главами:\n\n"
-            "1) «Мало интересовался, хочу понимать»\n"
-            "2) «Слышал, знаю немного, но не углублялся»\n"
-            "3) «Знаком с основами, хочу структурнее»\n\n"
-            "Это можно изменить в любой момент 🙂"
-        )
-    else:
-        text = (
-            "Great! Now choose your familiarity level with the weekly Torah portion:\n\n"
-            "1) “I have not really studied, I just want to understand the basics”\n"
-            "2) “I have heard things, I know a bit but not deeply”\n"
-            "3) “I know the basics and want more structure”\n\n"
-            "You can change this anytime 🙂"
-        )
-    keyboard = [
-        [
-            InlineKeyboardButton("1️⃣", callback_data="level_1"),
-            InlineKeyboardButton("2️⃣", callback_data="level_2"),
-            InlineKeyboardButton("3️⃣", callback_data="level_3"),
-        ]
-    ]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        parsha_text = await get_parsha_text(parsha_name)
+        structure = await extract_structure(parsha_text)
+        final_text = await format_as_rabbi(structure)
 
+        typing_task.cancel()
 
-# ---------- POST_INIT: КОМАНДНОЕ МЕНЮ ----------
+        for part in split_text(final_text):
+            await chat.send_message(part)
 
-async def post_init(application: Application):
+    except Exception as e:
+        typing_task.cancel()
+        logger.exception(e)
+        await chat.send_message("Произошла ошибка. Попробуй позже.")
+
+# ---------------- /help ----------------
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/parsha — объяснение текущей главы\n"
+        "/start — приветствие"
+    )
+
+# ---------------- MAIN ----------------
+
+async def post_init(app):
     commands = [
-        BotCommand("start", "Начать / изменить настройки"),
-        BotCommand("parsha", "Объяснение текущей главы"),
-        BotCommand("settings", "Показать мои настройки"),
+        BotCommand("start", "Начать"),
+        BotCommand("parsha", "Текущая глава"),
         BotCommand("help", "Помощь"),
     ]
-    await application.bot.set_my_commands(commands)
-    logger.info("Bot commands menu set")
-
-
-# ---------- MAIN ----------
+    await app.bot.set_my_commands(commands)
 
 def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_TOKEN is not set")
-
-    application = (
+    app = (
         ApplicationBuilder()
-        .token(token)
+        .token(TELEGRAM_TOKEN)
         .post_init(post_init)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("parsha", parsha_command))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("parsha", parsha))
+    app.add_handler(CommandHandler("help", help_command))
 
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, timezone_text_handler))
-
-    scheduler.start()
-    logger.info("Bot started")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
-
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
