@@ -23,9 +23,12 @@ logger = logging.getLogger("torah_bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))  # Dubai default
 
-# geonameid по умолчанию: Dubai (Diaspora)
-HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))
+# Можно переопределить списки моделей через переменные:
+# OPENAI_MODELS_FAST="gpt-5-mini,gpt-5,gpt-4.1-mini"
+OPENAI_MODELS_FAST = os.getenv("OPENAI_MODELS_FAST", "gpt-5-mini,gpt-5,gpt-4.1-mini")
+MODEL_CHAIN = [m.strip() for m in OPENAI_MODELS_FAST.split(",") if m.strip()]
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -102,7 +105,7 @@ def split_text(text: str, limit: int = 4000) -> List[str]:
 LAST_ERROR_BY_USER: Dict[int, str] = {}
 
 def set_last_error(user_id: int, msg: str):
-    LAST_ERROR_BY_USER[user_id] = msg[:3500]  # чтобы не улететь за лимит
+    LAST_ERROR_BY_USER[user_id] = msg[:3500]
 
 def get_last_error(user_id: int) -> str:
     return LAST_ERROR_BY_USER.get(user_id, "Нет сохранённой ошибки. Всё ок или бот ещё не падал 🙂")
@@ -118,11 +121,6 @@ async def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 
 # ---------------- Hebcal: текущая парша (Diaspora) ----------------
 
 async def get_current_parsha_diaspora() -> Optional[str]:
-    """
-    1) Shabbat API: пытаемся получить parashat по geonameid (Diaspora).
-    2) Если нет parashat (иногда праздник) — fallback на calendar API (21 день).
-    """
-    # 1) Shabbat API
     shabbat_url = "https://www.hebcal.com/shabbat"
     shabbat_params = {
         "cfg": "json",
@@ -140,10 +138,8 @@ async def get_current_parsha_diaspora() -> Optional[str]:
 
     for item in data.get("items", []):
         if item.get("category") == "parashat" and item.get("title"):
-            title = item["title"]
-            return title.replace("Parashat ", "").strip()
+            return item["title"].replace("Parashat ", "").strip()
 
-    # 2) Fallback calendar API
     cal_url = "https://www.hebcal.com/hebcal"
     today = date.today()
     end = today + timedelta(days=21)
@@ -167,18 +163,13 @@ async def get_current_parsha_diaspora() -> Optional[str]:
 
     for item in data2.get("items", []):
         if item.get("category") == "parashat" and item.get("title"):
-            title = item["title"]
-            return title.replace("Parashat ", "").strip()
+            return item["title"].replace("Parashat ", "").strip()
 
     return None
 
 # ---------------- Sefaria: robust fetch ----------------
 
 async def sefaria_get_text_by_ref(ref: str) -> str:
-    """
-    Пытаемся получить текст по ref из Sefaria.
-    Возвращаем склеенный текст (иврит), как сырьё.
-    """
     encoded_ref = quote(ref, safe="")
     url = f"https://www.sefaria.org/api/texts/{encoded_ref}"
     params = {"lang": "he", "context": "0", "commentary": "0"}
@@ -200,20 +191,11 @@ async def sefaria_get_text_by_ref(ref: str) -> str:
     return joined[:20000]
 
 async def sefaria_try_parsha_text(parsha_name: str) -> str:
-    """
-    Проблема часто в том, что Hebcal имя != Sefaria ref.
-    Поэтому пробуем несколько ref-ов:
-    1) Torah, <name>
-    2) <name>
-    3) Parashat <name>
-    4) Если всё упало — берём ref из sefaria calendars (diaspora=1) и по нему тянем текст.
-    """
     candidates = [
         f"Torah, {parsha_name}",
         parsha_name,
         f"Parashat {parsha_name}",
     ]
-
     last_err = None
     for ref in candidates:
         try:
@@ -222,30 +204,53 @@ async def sefaria_try_parsha_text(parsha_name: str) -> str:
             last_err = e
             logger.warning(f"Sefaria ref failed: {ref} -> {e}")
 
-    # fallback: calendars endpoint
-    # у sefaria есть общий календарь; diaspora=1 чтобы соответствовать Diaspora
+    # calendars fallback (diaspora=1)
     try:
         cal = await http_get_json("https://www.sefaria.org/api/calendars", params={"diaspora": "1"}, timeout=25)
-        # пытаемся найти weekly parashah
-        # структура может меняться, поэтому ищем по ключевым полям максимально мягко
         items = cal.get("calendar_items") or cal.get("items") or []
         ref_from_calendar = None
-
         for it in items:
-            # варианты: title / displayValue / ref / category / type
             title = (it.get("title") or it.get("displayValue") or "").lower()
             if "parash" in title or "parsha" in title or "hashavua" in title:
                 ref_from_calendar = it.get("ref") or it.get("displayRef") or it.get("anchorRef")
                 if ref_from_calendar:
                     break
-
         if ref_from_calendar:
             return await sefaria_get_text_by_ref(ref_from_calendar)
-
         raise RuntimeError("Sefaria calendars: parasha ref not found")
     except Exception as e:
-        logger.warning(f"Sefaria calendars fallback failed: {e}")
         raise RuntimeError(f"Sefaria failed for '{parsha_name}'. Last: {last_err}") from e
+
+# ---------------- OpenAI: helper with model fallback ----------------
+
+async def openai_chat_with_fallback(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    timeout_s: int,
+) -> str:
+    last_err = None
+    for model in MODEL_CHAIN:
+        try:
+            resp = await openai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                timeout=timeout_s,
+            )
+            out = resp.choices[0].message.content.strip()
+            if not out:
+                raise RuntimeError(f"Empty response from model {model}")
+            logger.info(f"OpenAI used model: {model}")
+            return out
+        except Exception as e:
+            last_err = e
+            logger.warning(f"OpenAI model failed {model}: {e}")
+            continue
+    raise RuntimeError(f"All OpenAI models failed. Last error: {last_err}")
 
 # ---------------- OpenAI: шаг 1 (структура) ----------------
 
@@ -257,39 +262,23 @@ async def extract_structure_from_text(parsha_text: str) -> str:
 Текст:
 {parsha_text}
 """
-
-    resp = await openai_client.chat.completions.create(
-        model="gpt-5.1-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_EXTRACT},
-            {"role": "user", "content": prompt},
-        ],
+    return await openai_chat_with_fallback(
+        system_prompt=SYSTEM_PROMPT_EXTRACT,
+        user_prompt=prompt,
         temperature=0.1,
-        timeout=25,
+        timeout_s=25,
     )
-    out = resp.choices[0].message.content.strip()
-    if not out:
-        raise RuntimeError("OpenAI returned empty structure")
-    return out
 
 # ---------------- OpenAI: шаг 2 (раввин) ----------------
 
 async def format_as_rabbi(structure_text: str) -> str:
     prompt = f"STRUCTURE:\n{structure_text}\n"
-
-    resp = await openai_client.chat.completions.create(
-        model="gpt-5.1-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_RABBI},
-            {"role": "user", "content": prompt},
-        ],
+    return await openai_chat_with_fallback(
+        system_prompt=SYSTEM_PROMPT_RABBI,
+        user_prompt=prompt,
         temperature=0.6,
-        timeout=30,
+        timeout_s=30,
     )
-    out = resp.choices[0].message.content.strip()
-    if not out:
-        raise RuntimeError("OpenAI returned empty final text")
-    return out
 
 # ---------------- Команды ----------------
 
@@ -321,11 +310,10 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     typing_task = asyncio.create_task(send_typing(chat, duration_seconds=40))
 
     try:
-        set_last_error(user_id, "OK: started /parsha")
+        set_last_error(user_id, f"OK: started /parsha. MODEL_CHAIN={MODEL_CHAIN}")
 
         # 1) Hebcal
         parsha_name = await get_current_parsha_diaspora()
-        logger.info(f"hebcal -> {parsha_name}")
         if not parsha_name:
             typing_task.cancel()
             set_last_error(user_id, "Hebcal: не удалось определить parasha (нет category=parashat).")
@@ -333,40 +321,13 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 2) Sefaria
-        try:
-            parsha_text = await sefaria_try_parsha_text(parsha_name)
-        except Exception as e:
-            typing_task.cancel()
-            set_last_error(user_id, f"Sefaria error for '{parsha_name}': {repr(e)}")
-            await chat.send_message(
-                "Ошибка при получении текста главы из источника.\n"
-                "Напиши /debug — покажу, на чём именно упало."
-            )
-            return
+        parsha_text = await sefaria_try_parsha_text(parsha_name)
 
         # 3) OpenAI step 1
-        try:
-            structure = await extract_structure_from_text(parsha_text)
-        except Exception as e:
-            typing_task.cancel()
-            set_last_error(user_id, f"OpenAI step1 (structure) error: {repr(e)}")
-            await chat.send_message(
-                "Ошибка при построении структуры главы.\n"
-                "Напиши /debug — покажу, на чём именно упало."
-            )
-            return
+        structure = await extract_structure_from_text(parsha_text)
 
         # 4) OpenAI step 2
-        try:
-            final_text = await format_as_rabbi(structure)
-        except Exception as e:
-            typing_task.cancel()
-            set_last_error(user_id, f"OpenAI step2 (format) error: {repr(e)}")
-            await chat.send_message(
-                "Ошибка при формировании текста объяснения.\n"
-                "Напиши /debug — покажу, на чём именно упало."
-            )
-            return
+        final_text = await format_as_rabbi(structure)
 
         typing_task.cancel()
         set_last_error(user_id, "OK: success")
@@ -379,16 +340,9 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await chat.send_message(part)
 
-    except httpx.HTTPStatusError as e:
-        typing_task.cancel()
-        msg = f"HTTPStatusError: {e.response.status_code} body={e.response.text[:500]}"
-        set_last_error(user_id, msg)
-        logger.exception(msg)
-        await chat.send_message("Сетевая ошибка при запросе данных. Напиши /debug.")
-
     except Exception as e:
         typing_task.cancel()
-        msg = f"Unhandled error: {repr(e)}"
+        msg = f"ERROR: {repr(e)}"
         set_last_error(user_id, msg)
         logger.exception(msg)
         await chat.send_message("Техническая ошибка. Напиши /debug — покажу подробности.")
@@ -403,7 +357,6 @@ async def post_init(app):
         BotCommand("help", "Помощь"),
     ]
     await app.bot.set_my_commands(commands)
-    logger.info("Commands menu set")
 
 # ---------------- MAIN ----------------
 
@@ -420,7 +373,7 @@ def main():
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("parsha", cmd_parsha))
 
-    logger.info("Bot polling started")
+    logger.info(f"Bot started. MODEL_CHAIN={MODEL_CHAIN}")
     app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
 
 if __name__ == "__main__":
