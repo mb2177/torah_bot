@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import asyncio
 import logging
 from datetime import date, timedelta
@@ -23,12 +25,15 @@ logger = logging.getLogger("torah_bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))  # Dubai default
 
-# Можно переопределить цепочку моделей:
-# OPENAI_MODELS_FAST="gpt-5-mini,gpt-5,gpt-4.1-mini"
-OPENAI_MODELS_FAST = os.getenv("OPENAI_MODELS_FAST", "gpt-5-mini,gpt-5,gpt-4.1-mini")
-MODEL_CHAIN = [m.strip() for m in OPENAI_MODELS_FAST.split(",") if m.strip()]
+# geonameid по умолчанию: Dubai (Diaspora)
+HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))
+
+# Цепочка моделей (если какая-то не доступна — упадём на следующую)
+# Можно поменять в Railway Variables:
+# OPENAI_MODELS="gpt-5-mini,gpt-5,gpt-4.1-mini"
+OPENAI_MODELS = os.getenv("OPENAI_MODELS", "gpt-5-mini,gpt-5,gpt-4.1-mini")
+MODEL_CHAIN = [m.strip() for m in OPENAI_MODELS.split(",") if m.strip()]
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -37,83 +42,72 @@ if not OPENAI_API_KEY:
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ---------------- ПРАВИЛА (как ты дал) ----------------
-# Важно: пункт #2 про "упрощать язык" игнорируем (как ты попросил).
-# Но краткость и понятность оставляем, потому что Telegram.
+# ---------------- ТВОЙ ПРОМПТ (SYSTEM) ----------------
+
+SYSTEM_PROMPT_MAIN = r"""
+Ты - преподаватель Торы, пишешь для Telegram-бота краткий и максимально точный рассказ о недельной главе Торы.
+
+Цель: дать читателю (без религиозного образования) понятный, уважительный и интересный пересказ главы, без ошибок и без выдумок.
+
+ОЧЕНЬ ВАЖНО:
+- Описывай только то, что действительно есть в тексте этой недельной главы.
+- Никаких мидрашей, каббалы, талмудических споров, современных сравнений и "добавленных деталей".
+- Если есть сомнение в детали - НЕ добавляй её. Лучше напиши более общими словами.
+
+-----------------------
+ШАГ 1: САМOПРОВЕРКА ВНАЧАЛЕ (ВНУТРЕННЕ, НЕ ПОКАЗЫВАЙ ЧИТАТЕЛЮ)
+Перед тем как писать финальный текст, сделай внутренний план-проверку:
+1) Мысленно перечисли 8-12 ключевых событий/заповедей этой главы (без лишних деталей).
+2) Проверь, что они относятся именно к этой главе, а не к соседним.
+3) Проверь, что не путаешь названия предметов и мест (например: Шатёр встречи ≠ Мишкан; Скрижали ≠ Ковчег; жертвенник ≠ Мишкан).
+4) Только после этой проверки начинай писать пост.
+
+Важно: этот внутренний план НЕ выводи в ответ. Пользователь должен видеть только готовый текст.
+
+-----------------------
+ПРАВИЛА СТИЛЯ И ТОЧНОСТИ
+1) Пиши простым и живым языком: как будто объясняешь другу спокойно и уважительно.
+2) Короткие предложения. Короткие абзацы. Удобно читать с телефона.
+3) Используй традиционные еврейские имена и термины:
+   Моше, Аарон, Всевышний, Мишкан, Синай, левиты, скрижали и т.д.
+4) Не используй церковно-академические слова и тяжёлые формулировки:
+   избегай "божественная кара", "беззаконие", "курительная смесь".
+   пиши проще: "народ был наказан", "народ согрешил", "священные благовония".
+5) Описывай Всевышнего уважительно и аккуратно:
+   "Всевышний сказал/повелел/сообщил", без слишком человеческих выражений.
+6) Сохраняй порядок событий, как в тексте Торы.
+7) Не пиши слишком длинно: объём поста должен читаться за 45-90 секунд.
+
+-----------------------
+ОБЯЗАТЕЛЬНЫЕ ЭЛЕМЕНТЫ ПОСТА
+- Заголовок: "📖 Недельная глава: <название>"
+- Далее: последовательный пересказ главных событий (без перегруза деталями).
+- В конце: 1-2 мягкие жизненные мысли (без морализаторства и без "пугающих" формулировок),
+  максимум 3-4 предложения: чему учит глава и как это применить в жизни.
+
+-----------------------
+ШАГ 2: САМOПРОВЕРКА ПЕРЕД ОТПРАВКОЙ (ВНУТРЕННЕ, НЕ ПОКАЗЫВАЙ ЧИТАТЕЛЮ)
+Перед тем как выдать финальный текст, проверь:
+- Все события действительно из этой главы?
+- Ничего не добавлено "от себя" как факт?
+- Не перепутаны термины (Шатёр встречи/Мишкан и т.п.)?
+- Текст простой и лёгкий для Telegram?
+- Нет тяжёлых слов и академического тона?
+Если что-то не уверен - упростить и убрать спорные детали.
+
+Важно: этот чеклист НЕ выводи в ответ. Пользователь должен видеть только финальный пост.
+""".strip()
+
+# ---------------- Шаг 1 (извлечение событий) ----------------
 
 SYSTEM_PROMPT_EXTRACT = """
-Ты извлекаешь ТОЛЬКО последовательность событий недельной главы из исходного текста Торы.
+Ты извлекаешь 8-12 ключевых событий/заповедей недельной главы Торы из данного текста (сырьё).
+Только события/заповеди. Строго в порядке, как в тексте.
+Без объяснений. Без выводов. Без новых деталей.
+Если в детали не уверен — пиши более общо.
 
-Выход: список событий (12-30 коротких пунктов), строго в правильном порядке.
-
-Запреты:
-- не добавляй ничего от себя
-- не смешивай с другими главами
-- не меняй порядок
-- не вставляй объяснения или выводы
-- не цитируй дословно длинные куски
-- если не уверен - пиши более общо и без деталей
-"""
-
-SYSTEM_PROMPT_RABBI = """
-Ты пишешь сообщение для Telegram о недельной главе Торы. Пишешь ТОЛЬКО по-русски.
-Тон - спокойный, уважительный, без шуток, без сарказма, без давления.
-
-Тебе передан список событий главы в правильном порядке. Ты обязан:
-- описывать только то, что есть в списке
-- не добавлять новых событий, людей, сцен
-- не менять порядок событий
-- не добавлять диалоги
-- если есть сомнение - описывай обобщенно и без деталей
-
-Лексика:
-- используй традиционные еврейские имена: Моше, Аарон, Всевышний, Мишкан, Синай
-- НЕ используй: Моисей, Господь, Библия, табернакль
-- про Всевышнего пиши аккуратно: "Всевышний сказал/сообщил/повелел"
-- НЕ очеловечивай: нельзя "разозлился", "передумал", "обиделся" и т.п.
-
-Содержание:
-- без галахи и практических предписаний
-- без каббалы, без сложных мидрашей, без талмудических дискуссий
-- без политики и современных конфликтов
-
-Длина:
-- "Что произошло" - 2-4 абзаца (не список, а связное повествование)
-- "Смысл" - 1 абзац
-- "Мысль" - 2-3 предложения
-
-Формат (ровно так, с заголовками):
-Что произошло на этой неделе
-<2-4 абзаца>
-
-Какой в этом смысл
-<1 абзац>
-
-Мысль на жизнь
-<2-3 предложения>
-"""
-
-SYSTEM_PROMPT_CHECK = """
-Ты строгий проверяющий текста. Тебе дают:
-1) EVENTS - список событий главы
-2) DRAFT - готовый текст
-
-Нужно проверить:
-A) Нет ли в DRAFT событий, которых нет в EVENTS
-B) Не перепутан ли порядок (грубо, по смыслу)
-C) Используются ли правильные имена: Моше, Всевышний, Аарон, Мишкан
-D) Нет ли запрещенной лексики: Моисей, Господь, Библия, "Бог разозлился/передумал" и т.п.
-E) Нет ли галахи, каббалы, политики, морализаторства
-
-Выход строго в JSON:
-{
-  "ok": true/false,
-  "issues": ["...","..."],
-  "fix_instructions": "одной строкой, что исправить"
-}
-
-Если сомневаешься - ставь ok=false.
-"""
+Выход: ровно 8-12 коротких пунктов, каждый с новой строки, без нумерации.
+""".strip()
 
 # ---------------- UX: typing ----------------
 
@@ -151,7 +145,7 @@ def set_last_error(user_id: int, msg: str):
     LAST_ERROR_BY_USER[user_id] = msg[:3500]
 
 def get_last_error(user_id: int) -> str:
-    return LAST_ERROR_BY_USER.get(user_id, "Нет сохранённой ошибки. Всё ок или бот ещё не падал 🙂")
+    return LAST_ERROR_BY_USER.get(user_id, "Нет сохранённой ошибки 🙂")
 
 # ---------------- HTTP ----------------
 
@@ -183,6 +177,7 @@ async def get_current_parsha_diaspora() -> Optional[str]:
         if item.get("category") == "parashat" and item.get("title"):
             return item["title"].replace("Parashat ", "").strip()
 
+    # fallback: calendar API ближайшие 21 день
     cal_url = "https://www.hebcal.com/hebcal"
     today = date.today()
     end = today + timedelta(days=21)
@@ -197,7 +192,6 @@ async def get_current_parsha_diaspora() -> Optional[str]:
         "mod": "off",
         "nx": "off",
     }
-
     try:
         data2 = await http_get_json(cal_url, params=cal_params, timeout=20)
     except Exception as e:
@@ -210,7 +204,7 @@ async def get_current_parsha_diaspora() -> Optional[str]:
 
     return None
 
-# ---------------- Sefaria ----------------
+# ---------------- Sefaria: текст как сырьё ----------------
 
 async def sefaria_get_text_by_ref(ref: str) -> str:
     encoded_ref = quote(ref, safe="")
@@ -248,23 +242,21 @@ async def sefaria_try_parsha_text(parsha_name: str) -> str:
             logger.warning(f"Sefaria ref failed: {ref} -> {e}")
 
     # calendars fallback (diaspora=1)
-    try:
-        cal = await http_get_json("https://www.sefaria.org/api/calendars", params={"diaspora": "1"}, timeout=25)
-        items = cal.get("calendar_items") or cal.get("items") or []
-        ref_from_calendar = None
-        for it in items:
-            title = (it.get("title") or it.get("displayValue") or "").lower()
-            if "parash" in title or "parsha" in title or "hashavua" in title:
-                ref_from_calendar = it.get("ref") or it.get("displayRef") or it.get("anchorRef")
-                if ref_from_calendar:
-                    break
-        if ref_from_calendar:
-            return await sefaria_get_text_by_ref(ref_from_calendar)
-        raise RuntimeError("Sefaria calendars: parasha ref not found")
-    except Exception as e:
-        raise RuntimeError(f"Sefaria failed for '{parsha_name}'. Last: {last_err}") from e
+    cal = await http_get_json("https://www.sefaria.org/api/calendars", params={"diaspora": "1"}, timeout=25)
+    items = cal.get("calendar_items") or cal.get("items") or []
+    ref_from_calendar = None
+    for it in items:
+        title = (it.get("title") or it.get("displayValue") or "").lower()
+        if "parash" in title or "parsha" in title or "hashavua" in title:
+            ref_from_calendar = it.get("ref") or it.get("displayRef") or it.get("anchorRef")
+            if ref_from_calendar:
+                break
+    if ref_from_calendar:
+        return await sefaria_get_text_by_ref(ref_from_calendar)
 
-# ---------------- OpenAI: fallback runner ----------------
+    raise RuntimeError(f"Sefaria failed for '{parsha_name}'. Last: {last_err}")
+
+# ---------------- OpenAI: runner with fallback ----------------
 
 async def openai_chat_with_fallback(
     system_prompt: str,
@@ -295,20 +287,15 @@ async def openai_chat_with_fallback(
             continue
     raise RuntimeError(f"All OpenAI models failed. Last error: {last_err}")
 
-# ---------------- Шаг 1: события ----------------
+# ---------------- Step 1: extract 8-12 key events ----------------
 
-async def extract_events_list(parsha_text: str) -> str:
+async def extract_key_events(parsha_text: str) -> str:
     prompt = f"""
-Извлеки последовательность событий недельной главы.
-
-Требования:
-- 12-30 коротких пунктов
-- строго в правильном порядке
-- только события, без объяснений
-- если не уверен в детали - не уточняй
-
-Текст:
+Текст недельной главы (сырьё):
 {parsha_text}
+
+Сделай 8-12 ключевых событий/заповедей в правильном порядке.
+Только события. Без объяснений. Без нумерации.
 """
     return await openai_chat_with_fallback(
         system_prompt=SYSTEM_PROMPT_EXTRACT,
@@ -317,83 +304,140 @@ async def extract_events_list(parsha_text: str) -> str:
         timeout_s=35,
     )
 
-# ---------------- Шаг 2: текст раввина ----------------
+# ---------------- Step 2: generate final post (your prompt) ----------------
 
-async def generate_rabbi_message(events_list_text: str) -> str:
+async def generate_post(parsha_name: str, key_events: str) -> str:
     prompt = f"""
-События главы (в правильном порядке):
-{events_list_text}
+Название недельной главы: {parsha_name}
 
-Сделай итоговое Telegram-сообщение строго по правилам.
-Важно: не делай списков и нумерации - это должен быть связный рассказ.
+Опорные ключевые события/заповеди (в правильном порядке, только как опора):
+{key_events}
+
+Напиши финальный пост строго по правилам.
 """
     return await openai_chat_with_fallback(
-        system_prompt=SYSTEM_PROMPT_RABBI,
+        system_prompt=SYSTEM_PROMPT_MAIN,
         user_prompt=prompt,
-        temperature=0.5,
+        temperature=0.45,
         timeout_s=45,
     )
 
-# ---------------- Шаг 3: проверка ----------------
+# ---------------- Validator (hard rules) ----------------
 
-async def check_draft(events_list_text: str, draft_text: str) -> Dict[str, Any]:
-    prompt = f"""
-EVENTS:
-{events_list_text}
+BANNED_VISIBLE_WORDS = [
+    "самопроверка", "чеклист", "шаг 1", "шаг 2", "план",
+    "structure", "по структуре", "по списку", "по пунктам",
+]
+BANNED_CHRISTIAN = ["моисей", "господь", "библия", "табернакль"]
+BANNED_HUMANIZING = ["разозли", "передумал", "обидел", "расстроил", "взбес", "в ярости"]
+BANNED_POLITICS = ["президент", "война", "израиль", "палест", "украин", "росси"]  # грубый фильтр
+BANNED_HEAVY = ["божественная кара", "беззаконие", "курительная смесь"]
 
-DRAFT:
-{draft_text}
-"""
-    raw = await openai_chat_with_fallback(
-        system_prompt=SYSTEM_PROMPT_CHECK,
-        user_prompt=prompt,
-        temperature=0.0,
-        timeout_s=30,
+def estimate_read_seconds(text: str) -> int:
+    # грубо: 14 символов/сек + пробелы (быстрое чтение). Хватает для контроля длины.
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return 0
+    return max(10, int(len(t) / 14))
+
+def validate_post(text: str, parsha_name: str) -> List[str]:
+    issues = []
+    low = (text or "").lower()
+
+    # Must start with correct header
+    if not text.strip().startswith("📖 Недельная глава:"):
+        issues.append("Нет заголовка '📖 Недельная глава: ...' в начале.")
+
+    # Must contain parsha name somewhere near header
+    if parsha_name.lower() not in low:
+        issues.append("В заголовке или тексте не видно названия главы.")
+
+    # Banned visible words
+    for w in BANNED_VISIBLE_WORDS:
+        if w in low:
+            issues.append(f"Запрещенное слово/фраза в тексте: '{w}'")
+
+    # Christian terms
+    for w in BANNED_CHRISTIAN:
+        if w in low:
+            issues.append(f"Нежелательная лексика (заменить на еврейскую): '{w}'")
+
+    # Humanizing Hashem
+    for w in BANNED_HUMANIZING:
+        if w in low:
+            issues.append("Слишком человеческое описание Всевышнего (убрать/переписать).")
+            break
+
+    # Politics / modern conflicts
+    for w in BANNED_POLITICS:
+        if w in low:
+            issues.append("Есть современные/политические упоминания (убрать).")
+            break
+
+    # Heavy words explicitly banned
+    for w in BANNED_HEAVY:
+        if w in low:
+            issues.append(f"Тяжелая формулировка (упростить): '{w}'")
+
+    # Required names style (soft requirement)
+    if "всевышн" not in low:
+        issues.append("Не использовано слово 'Всевышний' (лучше использовать).")
+    if "моше" not in low and "аарон" not in low:
+        issues.append("Слишком безлично: нет Моше/Аарона (если они есть в главе, упомяни).")
+
+    # Length check: 45-90 sec target
+    sec = estimate_read_seconds(text)
+    if sec > 110:
+        issues.append(f"Слишком длинно для Telegram (оценка {sec} сек). Сократить.")
+    if sec < 30:
+        issues.append(f"Слишком коротко (оценка {sec} сек). Чуть добавить связности, без новых деталей.")
+
+    return issues
+
+async def rewrite_with_instructions(parsha_name: str, key_events: str, draft: str, issues: List[str]) -> str:
+    instruction = (
+        "Исправь текст строго по правилам. "
+        "Не добавляй новых событий, держись только ключевых событий. "
+        "Убери запрещенные слова и нежелательную лексику. "
+        "Сделай коротко для Telegram.\n"
+        f"Проблемы: {json.dumps(issues, ensure_ascii=False)}"
     )
-    # Пытаемся распарсить JSON максимально мягко
-    try:
-        import json
-        return json.loads(raw)
-    except Exception:
-        return {"ok": False, "issues": ["checker_json_parse_failed"], "fix_instructions": "Убери лишнее, соблюдай правила и корректные имена."}
-
-async def regenerate_with_fixes(events_list_text: str, draft_text: str, fix_instructions: str) -> str:
     prompt = f"""
-События главы (в правильном порядке):
-{events_list_text}
+Название недельной главы: {parsha_name}
 
-Текущий текст (его нельзя копировать, нужно переписать):
-{draft_text}
+Ключевые события/заповеди (опора, порядок важен):
+{key_events}
 
-Исправь строго по инструкции:
-{fix_instructions}
+Текущий текст:
+{draft}
 
-Важно: связное повествование, коротко, без списков, без нумерации.
+Инструкция:
+{instruction}
+
+Перепиши финальный пост заново (не списком), сохраняя порядок событий.
 """
     return await openai_chat_with_fallback(
-        system_prompt=SYSTEM_PROMPT_RABBI,
+        system_prompt=SYSTEM_PROMPT_MAIN,
         user_prompt=prompt,
-        temperature=0.3,
+        temperature=0.25,
         timeout_s=45,
     )
 
-# ---------------- Команды ----------------
+# ---------------- Telegram commands ----------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    await update.message.reply_text(
         "Шалом.\n\n"
-        "Я объясняю недельную главу Торы по-русски, уважительно и по делу.\n"
-        "Без фантазий, без галахи, без политики.\n\n"
-        "Нажми /parsha - пришлю объяснение главы этой недели."
+        "Я присылаю краткий и точный рассказ о недельной главе Торы.\n"
+        "Нажми /parsha — и я отправлю главу этой недели."
     )
-    await update.message.reply_text(text)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/parsha - объяснение текущей недельной главы\n"
-        "/debug - показать последнюю ошибку\n"
-        "/start - приветствие\n"
-        "/help - помощь\n"
+        "/parsha — получить недельную главу\n"
+        "/debug — последняя ошибка\n"
+        "/start — приветствие\n"
+        "/help — помощь\n"
     )
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,45 +455,48 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsha_name = await get_current_parsha_diaspora()
         if not parsha_name:
             typing_task.cancel()
-            set_last_error(user_id, "Hebcal: не удалось определить parasha.")
-            await chat.send_message("Не удалось определить текущую недельную главу. Попробуй еще раз чуть позже.")
+            set_last_error(user_id, "Hebcal: parasha not found.")
+            await chat.send_message("Не удалось определить текущую недельную главу. Попробуй чуть позже.")
             return
 
         parsha_text = await sefaria_try_parsha_text(parsha_name)
 
-        events_list = await extract_events_list(parsha_text)
+        # Step 1: 8-12 key events (internal, not shown)
+        key_events = await extract_key_events(parsha_text)
 
-        draft = await generate_rabbi_message(events_list)
+        # Step 2: generate final post
+        draft = await generate_post(parsha_name, key_events)
 
-        check = await check_draft(events_list, draft)
-        if not check.get("ok", False):
-            fix = check.get("fix_instructions", "Соблюдай правила и корректные имена, не добавляй событий.")
-            draft = await regenerate_with_fixes(events_list, draft, fix)
+        # Local validator + up to 2 rewrites
+        for attempt in range(3):
+            issues = validate_post(draft, parsha_name)
+            if not issues:
+                break
+            if attempt == 2:
+                # last attempt: accept but still send (лучше чем ничего)
+                logger.warning(f"Validator issues remain after retries: {issues}")
+                break
+            draft = await rewrite_with_instructions(parsha_name, key_events, draft, issues)
 
         typing_task.cancel()
         set_last_error(user_id, "OK: success")
 
-        header = f"📖 Недельная глава: {parsha_name}\n"
-        parts = split_text(draft)
-        for idx, part in enumerate(parts):
-            if idx == 0:
-                await chat.send_message(header + "\n" + part)
-            else:
-                await chat.send_message(part)
+        for part in split_text(draft):
+            await chat.send_message(part)
 
     except Exception as e:
         typing_task.cancel()
         msg = f"ERROR: {repr(e)}"
         set_last_error(user_id, msg)
         logger.exception(msg)
-        await chat.send_message("Техническая ошибка. Напиши /debug - покажу подробности.")
+        await chat.send_message("Техническая ошибка. Напиши /debug — покажу подробности.")
 
-# ---------------- post_init: меню команд ----------------
+# ---------------- post_init: command menu ----------------
 
 async def post_init(app):
     commands = [
         BotCommand("start", "Начать"),
-        BotCommand("parsha", "Текущая глава"),
+        BotCommand("parsha", "Недельная глава"),
         BotCommand("help", "Помощь"),
         BotCommand("debug", "Показать ошибку"),
     ]
