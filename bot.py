@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from datetime import date, timedelta
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
 import httpx
@@ -23,7 +23,9 @@ logger = logging.getLogger("torah_bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))  # Dubai default
+
+# geonameid по умолчанию: Dubai (Diaspora)
+HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -53,6 +55,8 @@ SYSTEM_PROMPT_RABBI = """
 1) Что произошло на этой неделе (главная часть, по пунктам, строго по STRUCTURE)
 2) Что в этом обычно видят комментаторы (мягко, без терминов)
 3) Короткая современная мысль (тепло, без морали)
+
+Если в STRUCTURE чего-то нет — НЕ добавляй.
 """
 
 SYSTEM_PROMPT_EXTRACT = """
@@ -66,7 +70,7 @@ SYSTEM_PROMPT_EXTRACT = """
 
 # ---------------- UX: typing ----------------
 
-async def send_typing(chat, duration_seconds: int = 25):
+async def send_typing(chat, duration_seconds: int = 30):
     for _ in range(duration_seconds * 2):
         try:
             await chat.send_chat_action("typing")
@@ -93,6 +97,24 @@ def split_text(text: str, limit: int = 4000) -> List[str]:
     parts.append(text)
     return parts
 
+# ---------------- Debug storage ----------------
+
+LAST_ERROR_BY_USER: Dict[int, str] = {}
+
+def set_last_error(user_id: int, msg: str):
+    LAST_ERROR_BY_USER[user_id] = msg[:3500]  # чтобы не улететь за лимит
+
+def get_last_error(user_id: int) -> str:
+    return LAST_ERROR_BY_USER.get(user_id, "Нет сохранённой ошибки. Всё ок или бот ещё не падал 🙂")
+
+# ---------------- HTTP helpers ----------------
+
+async def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 25) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        r = await c.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
 # ---------------- Hebcal: текущая парша (Diaspora) ----------------
 
 async def get_current_parsha_diaspora() -> Optional[str]:
@@ -111,10 +133,7 @@ async def get_current_parsha_diaspora() -> Optional[str]:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client_http:
-            r = await client_http.get(shabbat_url, params=shabbat_params)
-            r.raise_for_status()
-            data = r.json()
+        data = await http_get_json(shabbat_url, params=shabbat_params, timeout=20)
     except Exception as e:
         logger.warning(f"Hebcal shabbat API failed: {e}")
         data = {}
@@ -141,10 +160,7 @@ async def get_current_parsha_diaspora() -> Optional[str]:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client_http:
-            r2 = await client_http.get(cal_url, params=cal_params)
-            r2.raise_for_status()
-            data2 = r2.json()
+        data2 = await http_get_json(cal_url, params=cal_params, timeout=20)
     except Exception as e:
         logger.warning(f"Hebcal calendar API failed: {e}")
         return None
@@ -156,22 +172,18 @@ async def get_current_parsha_diaspora() -> Optional[str]:
 
     return None
 
-# ---------------- Sefaria: получить текст главы ----------------
+# ---------------- Sefaria: robust fetch ----------------
 
-async def get_parsha_text_sefaria(parsha_name: str) -> str:
+async def sefaria_get_text_by_ref(ref: str) -> str:
     """
-    Берём текст главы из Sefaria (иврит) только как сырьё, в чат не отправляем.
-    Ключевой фикс: URL-энкодим ref.
+    Пытаемся получить текст по ref из Sefaria.
+    Возвращаем склеенный текст (иврит), как сырьё.
     """
-    ref = f"Torah, {parsha_name}"
-    encoded_ref = quote(ref, safe="")  # <-- ВАЖНО: кодируем пробелы/запятые
+    encoded_ref = quote(ref, safe="")
     url = f"https://www.sefaria.org/api/texts/{encoded_ref}"
     params = {"lang": "he", "context": "0", "commentary": "0"}
 
-    async with httpx.AsyncClient(timeout=30) as client_http:
-        r = await client_http.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
+    data = await http_get_json(url, params=params, timeout=30)
 
     chunks: List[str] = []
     txt = data.get("text")
@@ -184,8 +196,56 @@ async def get_parsha_text_sefaria(parsha_name: str) -> str:
 
     joined = " ".join(chunks).strip()
     if not joined:
-        raise RuntimeError("Sefaria returned empty text for this ref")
+        raise RuntimeError(f"Sefaria empty text for ref='{ref}'")
     return joined[:20000]
+
+async def sefaria_try_parsha_text(parsha_name: str) -> str:
+    """
+    Проблема часто в том, что Hebcal имя != Sefaria ref.
+    Поэтому пробуем несколько ref-ов:
+    1) Torah, <name>
+    2) <name>
+    3) Parashat <name>
+    4) Если всё упало — берём ref из sefaria calendars (diaspora=1) и по нему тянем текст.
+    """
+    candidates = [
+        f"Torah, {parsha_name}",
+        parsha_name,
+        f"Parashat {parsha_name}",
+    ]
+
+    last_err = None
+    for ref in candidates:
+        try:
+            return await sefaria_get_text_by_ref(ref)
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Sefaria ref failed: {ref} -> {e}")
+
+    # fallback: calendars endpoint
+    # у sefaria есть общий календарь; diaspora=1 чтобы соответствовать Diaspora
+    try:
+        cal = await http_get_json("https://www.sefaria.org/api/calendars", params={"diaspora": "1"}, timeout=25)
+        # пытаемся найти weekly parashah
+        # структура может меняться, поэтому ищем по ключевым полям максимально мягко
+        items = cal.get("calendar_items") or cal.get("items") or []
+        ref_from_calendar = None
+
+        for it in items:
+            # варианты: title / displayValue / ref / category / type
+            title = (it.get("title") or it.get("displayValue") or "").lower()
+            if "parash" in title or "parsha" in title or "hashavua" in title:
+                ref_from_calendar = it.get("ref") or it.get("displayRef") or it.get("anchorRef")
+                if ref_from_calendar:
+                    break
+
+        if ref_from_calendar:
+            return await sefaria_get_text_by_ref(ref_from_calendar)
+
+        raise RuntimeError("Sefaria calendars: parasha ref not found")
+    except Exception as e:
+        logger.warning(f"Sefaria calendars fallback failed: {e}")
+        raise RuntimeError(f"Sefaria failed for '{parsha_name}'. Last: {last_err}") from e
 
 # ---------------- OpenAI: шаг 1 (структура) ----------------
 
@@ -238,44 +298,78 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Шалом.\n\n"
         "Я объясняю недельную главу Торы по-русски, структурно и точно.\n"
         "Без цитат, без галахи, без фантазий.\n\n"
-        "Нажми /parsha — и я пришлю объяснение главы этой недели."
+        "Нажми /parsha — и я пришлю объяснение главы этой недели.\n"
+        "Если что-то сломалось — /debug покажет последнюю ошибку."
     )
     await update.message.reply_text(text)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/parsha — объяснение текущей недельной главы\n"
+        "/debug — показать последнюю ошибку\n"
         "/start — приветствие\n"
         "/help — помощь\n"
     )
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text(get_last_error(user_id))
+
 async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     chat = update.effective_chat
-    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=30))
+    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=40))
 
     try:
-        logger.info("parsha: start")
-        parsha_name = await get_current_parsha_diaspora()
-        logger.info(f"parsha: hebcal -> {parsha_name}")
+        set_last_error(user_id, "OK: started /parsha")
 
+        # 1) Hebcal
+        parsha_name = await get_current_parsha_diaspora()
+        logger.info(f"hebcal -> {parsha_name}")
         if not parsha_name:
             typing_task.cancel()
+            set_last_error(user_id, "Hebcal: не удалось определить parasha (нет category=parashat).")
+            await chat.send_message("Не удалось определить текущую недельную главу. Попробуй ещё раз через минуту.")
+            return
+
+        # 2) Sefaria
+        try:
+            parsha_text = await sefaria_try_parsha_text(parsha_name)
+        except Exception as e:
+            typing_task.cancel()
+            set_last_error(user_id, f"Sefaria error for '{parsha_name}': {repr(e)}")
             await chat.send_message(
-                "Не удалось определить текущую недельную главу.\n"
-                "Попробуй ещё раз через минуту."
+                "Ошибка при получении текста главы из источника.\n"
+                "Напиши /debug — покажу, на чём именно упало."
             )
             return
 
-        parsha_text = await get_parsha_text_sefaria(parsha_name)
-        logger.info(f"parsha: sefaria text len={len(parsha_text)}")
+        # 3) OpenAI step 1
+        try:
+            structure = await extract_structure_from_text(parsha_text)
+        except Exception as e:
+            typing_task.cancel()
+            set_last_error(user_id, f"OpenAI step1 (structure) error: {repr(e)}")
+            await chat.send_message(
+                "Ошибка при построении структуры главы.\n"
+                "Напиши /debug — покажу, на чём именно упало."
+            )
+            return
 
-        structure = await extract_structure_from_text(parsha_text)
-        logger.info(f"parsha: structure len={len(structure)}")
-
-        final_text = await format_as_rabbi(structure)
-        logger.info(f"parsha: final len={len(final_text)}")
+        # 4) OpenAI step 2
+        try:
+            final_text = await format_as_rabbi(structure)
+        except Exception as e:
+            typing_task.cancel()
+            set_last_error(user_id, f"OpenAI step2 (format) error: {repr(e)}")
+            await chat.send_message(
+                "Ошибка при формировании текста объяснения.\n"
+                "Напиши /debug — покажу, на чём именно упало."
+            )
+            return
 
         typing_task.cancel()
+        set_last_error(user_id, "OK: success")
 
         header = f"📖 Недельная глава: {parsha_name}\n"
         parts = split_text(final_text)
@@ -287,13 +381,17 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except httpx.HTTPStatusError as e:
         typing_task.cancel()
-        logger.exception(f"HTTP error: {e.response.status_code} {e.response.text[:300]}")
-        await chat.send_message("Ошибка при получении данных главы. Попробуй чуть позже.")
+        msg = f"HTTPStatusError: {e.response.status_code} body={e.response.text[:500]}"
+        set_last_error(user_id, msg)
+        logger.exception(msg)
+        await chat.send_message("Сетевая ошибка при запросе данных. Напиши /debug.")
 
     except Exception as e:
         typing_task.cancel()
-        logger.exception(f"/parsha error: {e}")
-        await chat.send_message("Техническая ошибка. Попробуй чуть позже.")
+        msg = f"Unhandled error: {repr(e)}"
+        set_last_error(user_id, msg)
+        logger.exception(msg)
+        await chat.send_message("Техническая ошибка. Напиши /debug — покажу подробности.")
 
 # ---------------- post_init: меню команд ----------------
 
@@ -301,6 +399,7 @@ async def post_init(app):
     commands = [
         BotCommand("start", "Начать"),
         BotCommand("parsha", "Текущая глава"),
+        BotCommand("debug", "Показать последнюю ошибку"),
         BotCommand("help", "Помощь"),
     ]
     await app.bot.set_my_commands(commands)
@@ -318,6 +417,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("parsha", cmd_parsha))
 
     logger.info("Bot polling started")
