@@ -25,7 +25,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))  # Dubai default
 
-# Можно переопределить цепочку моделей через переменную:
+# Можно переопределить цепочку моделей:
 # OPENAI_MODELS_FAST="gpt-5-mini,gpt-5,gpt-4.1-mini"
 OPENAI_MODELS_FAST = os.getenv("OPENAI_MODELS_FAST", "gpt-5-mini,gpt-5,gpt-4.1-mini")
 MODEL_CHAIN = [m.strip() for m in OPENAI_MODELS_FAST.split(",") if m.strip()]
@@ -37,53 +37,87 @@ if not OPENAI_API_KEY:
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ---------------- PROMPTS ----------------
+# ---------------- ПРАВИЛА (как ты дал) ----------------
+# Важно: пункт #2 про "упрощать язык" игнорируем (как ты попросил).
+# Но краткость и понятность оставляем, потому что Telegram.
 
 SYSTEM_PROMPT_EXTRACT = """
-Ты выделяешь ТОЛЬКО последовательность событий недельной главы из исходного текста.
-Выход: список событий (10-30 коротких пунктов), строго в правильном порядке.
+Ты извлекаешь ТОЛЬКО последовательность событий недельной главы из исходного текста Торы.
 
-Жёсткие запреты:
+Выход: список событий (12-30 коротких пунктов), строго в правильном порядке.
+
+Запреты:
 - не добавляй ничего от себя
+- не смешивай с другими главами
 - не меняй порядок
-- не вставляй объяснения/мораль/комментарии
-- не цитируй дословно большие куски
+- не вставляй объяснения или выводы
+- не цитируй дословно длинные куски
+- если не уверен - пиши более общо и без деталей
 """
 
-SYSTEM_PROMPT_RABBI_NARRATIVE = """
-Ты раввин и преподаватель Торы. Пишешь ТОЛЬКО по-русски.
+SYSTEM_PROMPT_RABBI = """
+Ты пишешь сообщение для Telegram о недельной главе Торы. Пишешь ТОЛЬКО по-русски.
+Тон - спокойный, уважительный, без шуток, без сарказма, без давления.
 
-Тебе передан список событий недельной главы в правильном порядке.
-Ты обязан пересказать события строго по этому списку:
-- нельзя добавлять события, которых нет в списке
-- нельзя менять порядок
-- нельзя добавлять диалоги
-- нельзя цитировать Тору дословно
-- нельзя писать галаху/практические предписания
-- нельзя использовать каббалу и спорные мнения
-- нельзя давить морально
+Тебе передан список событий главы в правильном порядке. Ты обязан:
+- описывать только то, что есть в списке
+- не добавлять новых событий, людей, сцен
+- не менять порядок событий
+- не добавлять диалоги
+- если есть сомнение - описывай обобщенно и без деталей
 
-Стиль и лексика:
-- пиши как принято в еврейской среде: "Моше", "Аарон", "Всевышний"
-- можно упоминать "Мишкан (Скиния)" мягко, но без перегруза терминов
-- избегай "Бог сказал" и канцелярита. Только "Всевышний сказал/повелел"
-- не используй слово "Библия"
-- НЕ упоминай слова "структура", "по списку", "по пунктам", "STRUCTURE"
+Лексика:
+- используй традиционные еврейские имена: Моше, Аарон, Всевышний, Мишкан, Синай
+- НЕ используй: Моисей, Господь, Библия, табернакль
+- про Всевышнего пиши аккуратно: "Всевышний сказал/сообщил/повелел"
+- НЕ очеловечивай: нельзя "разозлился", "передумал", "обиделся" и т.п.
 
-Формат ответа (без нумерации, живое повествование):
-Заголовок: "Что произошло на этой неделе"
-- 4-10 абзацев короткими понятными фразами, как рассказ, чтобы человек понял сюжет.
+Содержание:
+- без галахи и практических предписаний
+- без каббалы, без сложных мидрашей, без талмудических дискуссий
+- без политики и современных конфликтов
 
-Затем заголовок: "Какой в этом смысл (мягко)"
-- 1-2 абзаца, без терминов, без споров.
+Длина:
+- "Что произошло" - 2-4 абзаца (не список, а связное повествование)
+- "Смысл" - 1 абзац
+- "Мысль" - 2-3 предложения
 
-Затем заголовок: "Мысль на жизнь"
-- 2-4 предложения, тепло и по-человечески, без морали "ты должен".
+Формат (ровно так, с заголовками):
+Что произошло на этой неделе
+<2-4 абзаца>
+
+Какой в этом смысл
+<1 абзац>
+
+Мысль на жизнь
+<2-3 предложения>
+"""
+
+SYSTEM_PROMPT_CHECK = """
+Ты строгий проверяющий текста. Тебе дают:
+1) EVENTS - список событий главы
+2) DRAFT - готовый текст
+
+Нужно проверить:
+A) Нет ли в DRAFT событий, которых нет в EVENTS
+B) Не перепутан ли порядок (грубо, по смыслу)
+C) Используются ли правильные имена: Моше, Всевышний, Аарон, Мишкан
+D) Нет ли запрещенной лексики: Моисей, Господь, Библия, "Бог разозлился/передумал" и т.п.
+E) Нет ли галахи, каббалы, политики, морализаторства
+
+Выход строго в JSON:
+{
+  "ok": true/false,
+  "issues": ["...","..."],
+  "fix_instructions": "одной строкой, что исправить"
+}
+
+Если сомневаешься - ставь ok=false.
 """
 
 # ---------------- UX: typing ----------------
 
-async def send_typing(chat, duration_seconds: int = 30):
+async def send_typing(chat, duration_seconds: int = 35):
     for _ in range(duration_seconds * 2):
         try:
             await chat.send_chat_action("typing")
@@ -91,13 +125,12 @@ async def send_typing(chat, duration_seconds: int = 30):
             pass
         await asyncio.sleep(0.5)
 
-# ---------------- Telegram limit split ----------------
+# ---------------- Telegram split ----------------
 
 def split_text(text: str, limit: int = 3800) -> List[str]:
     text = (text or "").strip()
     if not text:
         return ["(пустой ответ)"]
-
     parts = []
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -110,7 +143,7 @@ def split_text(text: str, limit: int = 3800) -> List[str]:
     parts.append(text)
     return parts
 
-# ---------------- Debug storage ----------------
+# ---------------- Debug ----------------
 
 LAST_ERROR_BY_USER: Dict[int, str] = {}
 
@@ -120,7 +153,7 @@ def set_last_error(user_id: int, msg: str):
 def get_last_error(user_id: int) -> str:
     return LAST_ERROR_BY_USER.get(user_id, "Нет сохранённой ошибки. Всё ок или бот ещё не падал 🙂")
 
-# ---------------- HTTP helpers ----------------
+# ---------------- HTTP ----------------
 
 async def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 25) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=timeout) as c:
@@ -128,7 +161,7 @@ async def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 
         r.raise_for_status()
         return r.json()
 
-# ---------------- Hebcal: текущая парша (Diaspora) ----------------
+# ---------------- Hebcal: parsha (Diaspora) ----------------
 
 async def get_current_parsha_diaspora() -> Optional[str]:
     shabbat_url = "https://www.hebcal.com/shabbat"
@@ -177,7 +210,7 @@ async def get_current_parsha_diaspora() -> Optional[str]:
 
     return None
 
-# ---------------- Sefaria: robust fetch ----------------
+# ---------------- Sefaria ----------------
 
 async def sefaria_get_text_by_ref(ref: str) -> str:
     encoded_ref = quote(ref, safe="")
@@ -231,7 +264,7 @@ async def sefaria_try_parsha_text(parsha_name: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Sefaria failed for '{parsha_name}'. Last: {last_err}") from e
 
-# ---------------- OpenAI: helper with model fallback ----------------
+# ---------------- OpenAI: fallback runner ----------------
 
 async def openai_chat_with_fallback(
     system_prompt: str,
@@ -262,17 +295,17 @@ async def openai_chat_with_fallback(
             continue
     raise RuntimeError(f"All OpenAI models failed. Last error: {last_err}")
 
-# ---------------- OpenAI: шаг 1 (структура событий) ----------------
+# ---------------- Шаг 1: события ----------------
 
 async def extract_events_list(parsha_text: str) -> str:
     prompt = f"""
-Выдели последовательность событий недельной главы.
+Извлеки последовательность событий недельной главы.
 
 Требования:
-- 10-30 коротких пунктов
+- 12-30 коротких пунктов
 - строго в правильном порядке
-- только события, без комментариев и выводов
-- не упоминай слова "структура" и т.п.
+- только события, без объяснений
+- если не уверен в детали - не уточняй
 
 Текст:
 {parsha_text}
@@ -281,22 +314,66 @@ async def extract_events_list(parsha_text: str) -> str:
         system_prompt=SYSTEM_PROMPT_EXTRACT,
         user_prompt=prompt,
         temperature=0.1,
-        timeout_s=30,
+        timeout_s=35,
     )
 
-# ---------------- OpenAI: шаг 2 (раввинское повествование) ----------------
+# ---------------- Шаг 2: текст раввина ----------------
 
-async def make_rabbi_message(events_list_text: str) -> str:
+async def generate_rabbi_message(events_list_text: str) -> str:
     prompt = f"""
-Список событий (в правильном порядке):
+События главы (в правильном порядке):
 {events_list_text}
 
-Сделай итоговое сообщение по правилам: живое повествование, без нумерации, без слова "структура".
+Сделай итоговое Telegram-сообщение строго по правилам.
+Важно: не делай списков и нумерации - это должен быть связный рассказ.
 """
     return await openai_chat_with_fallback(
-        system_prompt=SYSTEM_PROMPT_RABBI_NARRATIVE,
+        system_prompt=SYSTEM_PROMPT_RABBI,
         user_prompt=prompt,
-        temperature=0.6,
+        temperature=0.5,
+        timeout_s=45,
+    )
+
+# ---------------- Шаг 3: проверка ----------------
+
+async def check_draft(events_list_text: str, draft_text: str) -> Dict[str, Any]:
+    prompt = f"""
+EVENTS:
+{events_list_text}
+
+DRAFT:
+{draft_text}
+"""
+    raw = await openai_chat_with_fallback(
+        system_prompt=SYSTEM_PROMPT_CHECK,
+        user_prompt=prompt,
+        temperature=0.0,
+        timeout_s=30,
+    )
+    # Пытаемся распарсить JSON максимально мягко
+    try:
+        import json
+        return json.loads(raw)
+    except Exception:
+        return {"ok": False, "issues": ["checker_json_parse_failed"], "fix_instructions": "Убери лишнее, соблюдай правила и корректные имена."}
+
+async def regenerate_with_fixes(events_list_text: str, draft_text: str, fix_instructions: str) -> str:
+    prompt = f"""
+События главы (в правильном порядке):
+{events_list_text}
+
+Текущий текст (его нельзя копировать, нужно переписать):
+{draft_text}
+
+Исправь строго по инструкции:
+{fix_instructions}
+
+Важно: связное повествование, коротко, без списков, без нумерации.
+"""
+    return await openai_chat_with_fallback(
+        system_prompt=SYSTEM_PROMPT_RABBI,
+        user_prompt=prompt,
+        temperature=0.3,
         timeout_s=45,
     )
 
@@ -305,18 +382,18 @@ async def make_rabbi_message(events_list_text: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Шалом.\n\n"
-        "Я объясняю недельную главу Торы по-русски, понятно и по делу.\n"
-        "Стараюсь держаться текста и не добавлять лишнего.\n\n"
-        "Нажми /parsha — пришлю объяснение главы этой недели."
+        "Я объясняю недельную главу Торы по-русски, уважительно и по делу.\n"
+        "Без фантазий, без галахи, без политики.\n\n"
+        "Нажми /parsha - пришлю объяснение главы этой недели."
     )
     await update.message.reply_text(text)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/parsha — объяснение текущей недельной главы\n"
-        "/debug — показать последнюю ошибку\n"
-        "/start — приветствие\n"
-        "/help — помощь\n"
+        "/parsha - объяснение текущей недельной главы\n"
+        "/debug - показать последнюю ошибку\n"
+        "/start - приветствие\n"
+        "/help - помощь\n"
     )
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,7 +403,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat = update.effective_chat
-    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=45))
+    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=60))
 
     try:
         set_last_error(user_id, f"OK: started /parsha. MODEL_CHAIN={MODEL_CHAIN}")
@@ -335,20 +412,25 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not parsha_name:
             typing_task.cancel()
             set_last_error(user_id, "Hebcal: не удалось определить parasha.")
-            await chat.send_message("Не удалось определить текущую недельную главу. Попробуй ещё раз чуть позже.")
+            await chat.send_message("Не удалось определить текущую недельную главу. Попробуй еще раз чуть позже.")
             return
 
         parsha_text = await sefaria_try_parsha_text(parsha_name)
 
         events_list = await extract_events_list(parsha_text)
 
-        final_text = await make_rabbi_message(events_list)
+        draft = await generate_rabbi_message(events_list)
+
+        check = await check_draft(events_list, draft)
+        if not check.get("ok", False):
+            fix = check.get("fix_instructions", "Соблюдай правила и корректные имена, не добавляй событий.")
+            draft = await regenerate_with_fixes(events_list, draft, fix)
 
         typing_task.cancel()
         set_last_error(user_id, "OK: success")
 
         header = f"📖 Недельная глава: {parsha_name}\n"
-        parts = split_text(final_text)
+        parts = split_text(draft)
         for idx, part in enumerate(parts):
             if idx == 0:
                 await chat.send_message(header + "\n" + part)
@@ -360,7 +442,7 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"ERROR: {repr(e)}"
         set_last_error(user_id, msg)
         logger.exception(msg)
-        await chat.send_message("Техническая ошибка. Напиши /debug — покажу подробности.")
+        await chat.send_message("Техническая ошибка. Напиши /debug - покажу подробности.")
 
 # ---------------- post_init: меню команд ----------------
 
