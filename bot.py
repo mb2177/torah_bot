@@ -3,16 +3,11 @@ import asyncio
 import logging
 from datetime import date, timedelta
 from typing import Optional, List
+from urllib.parse import quote
 
 import httpx
-from zoneinfo import ZoneInfo
-
 from telegram import Update, BotCommand
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 from openai import AsyncOpenAI
 
@@ -28,13 +23,10 @@ logger = logging.getLogger("torah_bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# geonameid по умолчанию: Dubai (Diaspora)
-HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))
+HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))  # Dubai default
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
-
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -74,8 +66,8 @@ SYSTEM_PROMPT_EXTRACT = """
 
 # ---------------- UX: typing ----------------
 
-async def send_typing(chat, duration_seconds: int = 20):
-    for _ in range(duration_seconds * 2):  # раз в 0.5 сек
+async def send_typing(chat, duration_seconds: int = 25):
+    for _ in range(duration_seconds * 2):
         try:
             await chat.send_chat_action("typing")
         except Exception:
@@ -105,11 +97,10 @@ def split_text(text: str, limit: int = 4000) -> List[str]:
 
 async def get_current_parsha_diaspora() -> Optional[str]:
     """
-    1) Пытаемся через Shabbat API (лучше всего для parashat).
-    2) Если нет parashat (иногда праздник) — fallback на Calendar API и ищем ближайшую parashat в 21 день.
+    1) Shabbat API: пытаемся получить parashat по geonameid (Diaspora).
+    2) Если нет parashat (иногда праздник) — fallback на calendar API (21 день).
     """
-
-    # 1) Shabbat Times REST API
+    # 1) Shabbat API
     shabbat_url = "https://www.hebcal.com/shabbat"
     shabbat_params = {
         "cfg": "json",
@@ -117,7 +108,6 @@ async def get_current_parsha_diaspora() -> Optional[str]:
         "geonameid": HEBCAL_GEONAMEID,
         "m": "50",
         "leyning": "on",
-        # Diaspora: i=on НЕ ставим
     }
 
     try:
@@ -134,11 +124,10 @@ async def get_current_parsha_diaspora() -> Optional[str]:
             title = item["title"]
             return title.replace("Parashat ", "").strip()
 
-    # 2) Fallback: Calendar API (ищем ближайшую parashat в диапазоне)
+    # 2) Fallback calendar API
     cal_url = "https://www.hebcal.com/hebcal"
     today = date.today()
     end = today + timedelta(days=21)
-
     cal_params = {
         "v": "1",
         "cfg": "json",
@@ -149,7 +138,6 @@ async def get_current_parsha_diaspora() -> Optional[str]:
         "min": "off",
         "mod": "off",
         "nx": "off",
-        # Diaspora: i=on НЕ ставим
     }
 
     try:
@@ -172,25 +160,19 @@ async def get_current_parsha_diaspora() -> Optional[str]:
 
 async def get_parsha_text_sefaria(parsha_name: str) -> str:
     """
-    Берём текст из Sefaria (иврит), только как сырьё для извлечения структуры.
-    В чат это не отправляем.
+    Берём текст главы из Sefaria (иврит) только как сырьё, в чат не отправляем.
+    Ключевой фикс: URL-энкодим ref.
     """
-    # Обычно Sefaria понимает такие refs: "Torah, Vayishlach"
-    # Иногда могут быть нюансы с написанием. Если что — добавим fallback.
     ref = f"Torah, {parsha_name}"
-    url = f"https://www.sefaria.org/api/texts/{ref}"
-    params = {
-        "lang": "he",
-        "context": "0",
-        "commentary": "0",
-    }
+    encoded_ref = quote(ref, safe="")  # <-- ВАЖНО: кодируем пробелы/запятые
+    url = f"https://www.sefaria.org/api/texts/{encoded_ref}"
+    params = {"lang": "he", "context": "0", "commentary": "0"}
 
     async with httpx.AsyncClient(timeout=30) as client_http:
         r = await client_http.get(url, params=params)
         r.raise_for_status()
         data = r.json()
 
-    # Sefaria возвращает массивы секций/стихов — склеиваем в одну строку, ограничиваем размер
     chunks: List[str] = []
     txt = data.get("text")
     if isinstance(txt, list):
@@ -199,8 +181,11 @@ async def get_parsha_text_sefaria(parsha_name: str) -> str:
                 chunks.append(" ".join([str(x) for x in section if x]))
             elif section:
                 chunks.append(str(section))
+
     joined = " ".join(chunks).strip()
-    return joined[:20000]  # ограничим, чтобы не раздувать контекст
+    if not joined:
+        raise RuntimeError("Sefaria returned empty text for this ref")
+    return joined[:20000]
 
 # ---------------- OpenAI: шаг 1 (структура) ----------------
 
@@ -213,7 +198,6 @@ async def extract_structure_from_text(parsha_text: str) -> str:
 {parsha_text}
 """
 
-    # Быстрый/дешёвый режим для структуры
     resp = await openai_client.chat.completions.create(
         model="gpt-5.1-mini",
         messages=[
@@ -223,15 +207,16 @@ async def extract_structure_from_text(parsha_text: str) -> str:
         temperature=0.1,
         timeout=25,
     )
-    return resp.choices[0].message.content.strip()
+    out = resp.choices[0].message.content.strip()
+    if not out:
+        raise RuntimeError("OpenAI returned empty structure")
+    return out
 
-# ---------------- OpenAI: шаг 2 (форматирование "как раввин") ----------------
+# ---------------- OpenAI: шаг 2 (раввин) ----------------
 
 async def format_as_rabbi(structure_text: str) -> str:
     prompt = f"STRUCTURE:\n{structure_text}\n"
 
-    # Основной текст: тоже на gpt-5.1-mini
-    # Можно добавить fallback при желании, но сначала проверим качество/стабильность.
     resp = await openai_client.chat.completions.create(
         model="gpt-5.1-mini",
         messages=[
@@ -241,9 +226,12 @@ async def format_as_rabbi(structure_text: str) -> str:
         temperature=0.6,
         timeout=30,
     )
-    return resp.choices[0].message.content.strip()
+    out = resp.choices[0].message.content.strip()
+    if not out:
+        raise RuntimeError("OpenAI returned empty final text")
+    return out
 
-# ---------------- Команды Telegram ----------------
+# ---------------- Команды ----------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -263,10 +251,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=25))
+    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=30))
 
     try:
+        logger.info("parsha: start")
         parsha_name = await get_current_parsha_diaspora()
+        logger.info(f"parsha: hebcal -> {parsha_name}")
+
         if not parsha_name:
             typing_task.cancel()
             await chat.send_message(
@@ -275,23 +266,29 @@ async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 1) берём текст из Sefaria (сырьё)
         parsha_text = await get_parsha_text_sefaria(parsha_name)
+        logger.info(f"parsha: sefaria text len={len(parsha_text)}")
 
-        # 2) извлекаем структуру событий
         structure = await extract_structure_from_text(parsha_text)
+        logger.info(f"parsha: structure len={len(structure)}")
 
-        # 3) оформляем как раввин
         final_text = await format_as_rabbi(structure)
+        logger.info(f"parsha: final len={len(final_text)}")
 
         typing_task.cancel()
 
         header = f"📖 Недельная глава: {parsha_name}\n"
-        for idx, part in enumerate(split_text(final_text)):
+        parts = split_text(final_text)
+        for idx, part in enumerate(parts):
             if idx == 0:
                 await chat.send_message(header + "\n" + part)
             else:
                 await chat.send_message(part)
+
+    except httpx.HTTPStatusError as e:
+        typing_task.cancel()
+        logger.exception(f"HTTP error: {e.response.status_code} {e.response.text[:300]}")
+        await chat.send_message("Ошибка при получении данных главы. Попробуй чуть позже.")
 
     except Exception as e:
         typing_task.cancel()
