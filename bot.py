@@ -1,8 +1,10 @@
 import os
 import asyncio
 import logging
+from datetime import date, timedelta
+from typing import Optional, List
+
 import httpx
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from telegram import Update, BotCommand
@@ -16,202 +18,287 @@ from openai import AsyncOpenAI
 
 # ---------------- ЛОГИ ----------------
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+)
+logger = logging.getLogger("torah_bot")
 
-# ---------------- НАСТРОЙКИ ----------------
+# ---------------- ENV ----------------
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# geonameid по умолчанию: Dubai (Diaspora)
+HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))
+
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN not set")
+    raise RuntimeError("TELEGRAM_TOKEN is not set")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set")
+    raise RuntimeError("OPENAI_API_KEY is not set")
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ---------------- SYSTEM PROMPT ----------------
+# ---------------- PROMPTS ----------------
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_RABBI = """
 Ты раввин и преподаватель Торы.
 
-Ты получаешь STRUCTURE — это список событий главы в правильном порядке.
+Тебе передают STRUCTURE — список событий главы в правильном порядке.
 Ты НЕ имеешь права добавлять события вне STRUCTURE.
 Ты НЕ имеешь права менять порядок.
 Ты НЕ имеешь права добавлять диалоги.
 Ты НЕ имеешь права цитировать Тору дословно.
-Ты НЕ имеешь права писать галаху.
-Ты НЕ имеешь права использовать каббалу.
+Ты НЕ имеешь права писать галаху и практические предписания.
+Ты НЕ имеешь права использовать каббалу и спорные мнения.
 Ты НЕ имеешь права давить морально.
 
-Формат ответа:
-1) Структурный пересказ событий главы (по пунктам, строго по STRUCTURE)
-2) Мягкое объяснение того, что обычно в этом видят комментаторы
-3) Короткая современная мысль
-
 Пиши только по-русски.
-Пиши ясно, структурно, уверенно, как раввин.
+Пиши уверенно, структурно, понятно.
+
+Формат ответа:
+1) Что произошло на этой неделе (главная часть, по пунктам, строго по STRUCTURE)
+2) Что в этом обычно видят комментаторы (мягко, без терминов)
+3) Короткая современная мысль (тепло, без морали)
 """
 
-# ---------------- HELPER: typing ----------------
+SYSTEM_PROMPT_EXTRACT = """
+Ты выделяешь ТОЛЬКО структуру событий главы из исходного текста.
+Запреты:
+- не добавляй ничего от себя
+- не делай комментариев
+- не цитируй дословно длинные куски
+Выход: список пунктов (10-25 пунктов), в правильном порядке.
+"""
 
-async def send_typing(chat, duration=15):
-    for _ in range(duration * 2):
+# ---------------- UX: typing ----------------
+
+async def send_typing(chat, duration_seconds: int = 20):
+    for _ in range(duration_seconds * 2):  # раз в 0.5 сек
         try:
             await chat.send_chat_action("typing")
-        except:
+        except Exception:
             pass
         await asyncio.sleep(0.5)
 
-# ---------------- HEBcal: текущая парша (Diaspora) ----------------
+# ---------------- Telegram limit split ----------------
 
-async def get_current_parsha():
-    url = "https://www.hebcal.com/hebcal"
-    params = {
-        "v": "1",
+def split_text(text: str, limit: int = 4000) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return ["(пустой ответ)"]
+
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = text.rfind(" ", 0, limit)
+        if cut == -1:
+            cut = limit
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+    parts.append(text)
+    return parts
+
+# ---------------- Hebcal: текущая парша (Diaspora) ----------------
+
+async def get_current_parsha_diaspora() -> Optional[str]:
+    """
+    1) Пытаемся через Shabbat API (лучше всего для parashat).
+    2) Если нет parashat (иногда праздник) — fallback на Calendar API и ищем ближайшую parashat в 21 день.
+    """
+
+    # 1) Shabbat Times REST API
+    shabbat_url = "https://www.hebcal.com/shabbat"
+    shabbat_params = {
         "cfg": "json",
-        "maj": "on",
-        "min": "on",
-        "mod": "on",
-        "nx": "on",
-        "year": "now",
-        "month": "x",
-        "ss": "on",
-        # НЕТ i=on → значит Diaspora
+        "geo": "geoname",
+        "geonameid": HEBCAL_GEONAMEID,
+        "m": "50",
+        "leyning": "on",
+        # Diaspora: i=on НЕ ставим
     }
 
-    async with httpx.AsyncClient() as client_http:
-        r = await client_http.get(url, params=params)
-        data = r.json()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client_http:
+            r = await client_http.get(shabbat_url, params=shabbat_params)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        logger.warning(f"Hebcal shabbat API failed: {e}")
+        data = {}
 
     for item in data.get("items", []):
-        if item.get("category") == "parashat":
-            return item.get("title")
+        if item.get("category") == "parashat" and item.get("title"):
+            title = item["title"]
+            return title.replace("Parashat ", "").strip()
+
+    # 2) Fallback: Calendar API (ищем ближайшую parashat в диапазоне)
+    cal_url = "https://www.hebcal.com/hebcal"
+    today = date.today()
+    end = today + timedelta(days=21)
+
+    cal_params = {
+        "v": "1",
+        "cfg": "json",
+        "start": today.isoformat(),
+        "end": end.isoformat(),
+        "ss": "on",
+        "maj": "off",
+        "min": "off",
+        "mod": "off",
+        "nx": "off",
+        # Diaspora: i=on НЕ ставим
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client_http:
+            r2 = await client_http.get(cal_url, params=cal_params)
+            r2.raise_for_status()
+            data2 = r2.json()
+    except Exception as e:
+        logger.warning(f"Hebcal calendar API failed: {e}")
+        return None
+
+    for item in data2.get("items", []):
+        if item.get("category") == "parashat" and item.get("title"):
+            title = item["title"]
+            return title.replace("Parashat ", "").strip()
 
     return None
 
 # ---------------- Sefaria: получить текст главы ----------------
 
-async def get_parsha_text(parsha_name):
+async def get_parsha_text_sefaria(parsha_name: str) -> str:
+    """
+    Берём текст из Sefaria (иврит), только как сырьё для извлечения структуры.
+    В чат это не отправляем.
+    """
+    # Обычно Sefaria понимает такие refs: "Torah, Vayishlach"
+    # Иногда могут быть нюансы с написанием. Если что — добавим fallback.
     ref = f"Torah, {parsha_name}"
-    url = f"https://www.sefaria.org/api/texts/{ref}?lang=he&context=0"
+    url = f"https://www.sefaria.org/api/texts/{ref}"
+    params = {
+        "lang": "he",
+        "context": "0",
+        "commentary": "0",
+    }
 
     async with httpx.AsyncClient(timeout=30) as client_http:
-        r = await client_http.get(url)
+        r = await client_http.get(url, params=params)
+        r.raise_for_status()
         data = r.json()
 
-    # Возвращаем весь текст без форматирования
-    text = ""
-    if isinstance(data.get("text"), list):
-        for section in data["text"]:
+    # Sefaria возвращает массивы секций/стихов — склеиваем в одну строку, ограничиваем размер
+    chunks: List[str] = []
+    txt = data.get("text")
+    if isinstance(txt, list):
+        for section in txt:
             if isinstance(section, list):
-                text += " ".join(section) + " "
-            else:
-                text += str(section) + " "
-    return text[:15000]  # ограничиваем размер
+                chunks.append(" ".join([str(x) for x in section if x]))
+            elif section:
+                chunks.append(str(section))
+    joined = " ".join(chunks).strip()
+    return joined[:20000]  # ограничим, чтобы не раздувать контекст
 
-# ---------------- ШАГ 1: извлечь структуру ----------------
+# ---------------- OpenAI: шаг 1 (структура) ----------------
 
-async def extract_structure(parsha_text):
+async def extract_structure_from_text(parsha_text: str) -> str:
     prompt = f"""
-На основе следующего текста главы Торы выдели ТОЛЬКО структуру событий.
-Сделай список пунктов в правильном порядке.
-Без объяснений. Только события.
+Ниже дан текст главы (сырьё). Сделай список событий в правильном порядке.
+Только события. Без объяснений. Без цитат.
 
 Текст:
 {parsha_text}
 """
 
-    response = await client.chat.completions.create(
+    # Быстрый/дешёвый режим для структуры
+    resp = await openai_client.chat.completions.create(
         model="gpt-5.1-mini",
         messages=[
-            {"role": "system", "content": "Ты выделяешь только структуру событий."},
+            {"role": "system", "content": SYSTEM_PROMPT_EXTRACT},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.2,
+        temperature=0.1,
+        timeout=25,
     )
+    return resp.choices[0].message.content.strip()
 
-    return response.choices[0].message.content
+# ---------------- OpenAI: шаг 2 (форматирование "как раввин") ----------------
 
-# ---------------- ШАГ 2: форматирование как раввин ----------------
+async def format_as_rabbi(structure_text: str) -> str:
+    prompt = f"STRUCTURE:\n{structure_text}\n"
 
-async def format_as_rabbi(structure_text):
-    prompt = f"""
-STRUCTURE:
-{structure_text}
-"""
-
-    response = await client.chat.completions.create(
+    # Основной текст: тоже на gpt-5.1-mini
+    # Можно добавить fallback при желании, но сначала проверим качество/стабильность.
+    resp = await openai_client.chat.completions.create(
         model="gpt-5.1-mini",
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": SYSTEM_PROMPT_RABBI},
             {"role": "user", "content": prompt},
         ],
         temperature=0.6,
+        timeout=30,
     )
+    return resp.choices[0].message.content.strip()
 
-    return response.choices[0].message.content
+# ---------------- Команды Telegram ----------------
 
-# ---------------- Telegram limit split ----------------
-
-def split_text(text, limit=4000):
-    parts = []
-    while len(text) > limit:
-        split_at = text.rfind("\n", 0, limit)
-        if split_at == -1:
-            split_at = limit
-        parts.append(text[:split_at])
-        text = text[split_at:]
-    parts.append(text)
-    return parts
-
-# ---------------- /start ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Я объясняю недельную главу Торы структурно и точно.\n\n"
-        "Используй команду /parsha чтобы получить объяснение текущей главы."
+        "Шалом.\n\n"
+        "Я объясняю недельную главу Торы по-русски, структурно и точно.\n"
+        "Без цитат, без галахи, без фантазий.\n\n"
+        "Нажми /parsha — и я пришлю объяснение главы этой недели."
     )
     await update.message.reply_text(text)
 
-# ---------------- /parsha ----------------
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/parsha — объяснение текущей недельной главы\n"
+        "/start — приветствие\n"
+        "/help — помощь\n"
+    )
 
-async def parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-
-    typing_task = asyncio.create_task(send_typing(chat))
+    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=25))
 
     try:
-        parsha_name = await get_current_parsha()
+        parsha_name = await get_current_parsha_diaspora()
         if not parsha_name:
-            await chat.send_message("Не удалось определить текущую главу.")
+            typing_task.cancel()
+            await chat.send_message(
+                "Не удалось определить текущую недельную главу.\n"
+                "Попробуй ещё раз через минуту."
+            )
             return
 
-        parsha_text = await get_parsha_text(parsha_name)
-        structure = await extract_structure(parsha_text)
+        # 1) берём текст из Sefaria (сырьё)
+        parsha_text = await get_parsha_text_sefaria(parsha_name)
+
+        # 2) извлекаем структуру событий
+        structure = await extract_structure_from_text(parsha_text)
+
+        # 3) оформляем как раввин
         final_text = await format_as_rabbi(structure)
 
         typing_task.cancel()
 
-        for part in split_text(final_text):
-            await chat.send_message(part)
+        header = f"📖 Недельная глава: {parsha_name}\n"
+        for idx, part in enumerate(split_text(final_text)):
+            if idx == 0:
+                await chat.send_message(header + "\n" + part)
+            else:
+                await chat.send_message(part)
 
     except Exception as e:
         typing_task.cancel()
-        logger.exception(e)
-        await chat.send_message("Произошла ошибка. Попробуй позже.")
+        logger.exception(f"/parsha error: {e}")
+        await chat.send_message("Техническая ошибка. Попробуй чуть позже.")
 
-# ---------------- /help ----------------
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/parsha — объяснение текущей главы\n"
-        "/start — приветствие"
-    )
-
-# ---------------- MAIN ----------------
+# ---------------- post_init: меню команд ----------------
 
 async def post_init(app):
     commands = [
@@ -220,6 +307,9 @@ async def post_init(app):
         BotCommand("help", "Помощь"),
     ]
     await app.bot.set_my_commands(commands)
+    logger.info("Commands menu set")
+
+# ---------------- MAIN ----------------
 
 def main():
     app = (
@@ -229,11 +319,12 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("parsha", parsha))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("parsha", cmd_parsha))
 
-    app.run_polling()
+    logger.info("Bot polling started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
 
 if __name__ == "__main__":
     main()
