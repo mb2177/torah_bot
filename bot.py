@@ -1,519 +1,527 @@
+
+import asyncio
+import html
+import json
 import os
 import re
-import json
-import asyncio
-import logging
-from datetime import date, timedelta
-from typing import Optional, List, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-import httpx
-from telegram import Update, BotCommand
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
+import aiohttp
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
-
-# ---------------- LOGS ----------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
 )
-logger = logging.getLogger("torah_bot")
 
-# ---------------- ENV ----------------
+load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# Diaspora location (default Dubai)
-HEBCAL_GEONAMEID = int(os.getenv("HEBCAL_GEONAMEID", "292223"))
+SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Asia/Dubai")
+SCHEDULE_DAY_OF_WEEK = os.getenv("SCHEDULE_DAY_OF_WEEK", "sun")
+SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "12"))
+SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "20"))
 
-# Models fallback chain
-# Set in Railway:
-# OPENAI_MODELS="gpt-5-mini,gpt-5,gpt-4.1-mini"
-OPENAI_MODELS = os.getenv("OPENAI_MODELS", "gpt-5-mini,gpt-5,gpt-4.1-mini")
-MODEL_CHAIN = [m.strip() for m in OPENAI_MODELS.split(",") if m.strip()]
+ISRAEL = os.getenv("ISRAEL", "false").lower() == "true"
+TORAH_LANG = os.getenv("TORAH_LANG", "en").lower()
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+USERS_FILE = Path("users.json")
+CACHE_FILE = Path("cache.json")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ---------------- YOUR SYSTEM PROMPT ----------------
 
-SYSTEM_PROMPT_MAIN = """
-Ты - преподаватель Торы и пишешь для Telegram-бота краткое и максимально точное объяснение недельной главы Торы.
+# -------------------------
+# Storage
+# -------------------------
 
-Цель: дать читателю, даже без религиозного образования, понятный и уважительный пересказ главы. Текст должен быть точным, без выдумок и легко читаться.
-
-ОЧЕНЬ ВАЖНО:
-- Описывай только события, которые действительно происходят в этой недельной главе.
-- Не добавляй мидраши, каббалу, талмудические обсуждения или современные интерпретации.
-- Если есть сомнение в какой-то детали - не добавляй её, а опиши событие более общими словами.
-
-------------------------------------------------
-
-ШАГ 1. ВНУТРЕННЯЯ САМОПРОВЕРКА (НЕ ПОКАЗЫВАЙ ЧИТАТЕЛЮ)
-
-Перед написанием текста сначала мысленно составь краткий план главы:
-
-1. Перечисли для себя 8-12 ключевых событий или заповедей этой главы.
-2. Убедись, что они действительно относятся именно к этой главе, а не к соседним.
-3. Проверь, что не перепутаны важные понятия (например: Шатёр встречи ≠ Мишкан, Скрижали ≠ Ковчег).
-4. Убедись, что один из центральных духовных моментов главы будет отражён в тексте.
-
-Этот план нужен только для проверки. НЕ выводи его в ответ.
-
-------------------------------------------------
-
-ПРАВИЛА НАПИСАНИЯ ТЕКСТА
-
-1. Пиши простым и естественным языком, как будто спокойно объясняешь другу.
-2. Используй короткие предложения и небольшие абзацы, чтобы текст было легко читать в Telegram.
-3. Используй традиционные еврейские имена:
-   Моше, Аарон, Всевышний, Мишкан, Синай, левиты и т.д.
-4. Избегай тяжёлых или церковных выражений:
-   не пиши «божественная кара», «беззаконие», «курительная смесь».
-   Пиши проще: «народ согрешил», «народ был наказан», «священные благовония».
-5. Описывай Всевышнего уважительно и без слишком человеческих выражений.
-6. Сохраняй порядок событий так, как они происходят в Торе.
-7. Упоминай главные события главы, а не только второстепенные.
-
-------------------------------------------------
-
-СТРУКТУРА ТЕКСТА
-
-Начни так:
-
-📖 Недельная глава: [название главы]
-
-Далее:
-
-1. Коротко и ясно расскажи, что происходит в этой главе.
-2. Объясни главный смысл или духовную идею главы.
-3. Заверши короткой жизненной мыслью (2-4 предложения), чему эта глава может научить человека сегодня.
-
-Текст должен читаться примерно за 45-90 секунд.
-
-------------------------------------------------
-
-ШАГ 2. ПРОВЕРКА ПЕРЕД ОТПРАВКОЙ (НЕ ПОКАЗЫВАЙ ЧИТАТЕЛЮ)
-
-Перед тем как выдать финальный текст, проверь:
-
-1. Все ли основные события главы упомянуты?
-2. Нет ли событий из других глав?
-3. Не перепутаны ли названия предметов или мест?
-4. Текст легко ли читается и понятен ли человеку без религиозного образования?
-
-Если есть сомнения - упрости текст и убери спорные детали.
-
-------------------------------------------------
-
-Выведи только готовый текст поста без объяснений и без внутренних проверок.
-""".strip()
-
-# ---------------- INTERNAL STEP 1 (events list) ----------------
-
-SYSTEM_PROMPT_EXTRACT = """
-Ты извлекаешь 8-12 ключевых событий/заповедей недельной главы из данного текста (сырьё).
-Только события/заповеди. Строго в порядке, как в тексте.
-Без объяснений, без выводов, без новых деталей.
-Если в детали не уверен - пиши более общо.
-
-Формат вывода: 8-12 строк, каждая строка - одно событие. Без нумерации.
-""".strip()
-
-# ---------------- DEBUG STORAGE ----------------
-
-LAST_ERROR_BY_USER: Dict[int, str] = {}
-
-def set_last_error(user_id: int, msg: str):
-    LAST_ERROR_BY_USER[user_id] = msg[:3500]
-
-def get_last_error(user_id: int) -> str:
-    return LAST_ERROR_BY_USER.get(user_id, "Нет сохранённой ошибки.")
-
-# ---------------- UX: typing ----------------
-
-async def send_typing(chat, duration_seconds: int = 45):
-    for _ in range(duration_seconds * 2):
-        try:
-            await chat.send_chat_action("typing")
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
-
-# ---------------- TEXT SPLIT ----------------
-
-def split_text(text: str, limit: int = 3800) -> List[str]:
-    text = (text or "").strip()
-    if not text:
-        return ["(пустой ответ)"]
-    parts = []
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut == -1:
-            cut = text.rfind(" ", 0, limit)
-        if cut == -1:
-            cut = limit
-        parts.append(text[:cut].strip())
-        text = text[cut:].strip()
-    parts.append(text)
-    return parts
-
-# ---------------- HTTP HELPERS ----------------
-
-async def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 25) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
-
-# ---------------- HEBCAL (DIASPORA) ----------------
-
-async def get_current_parsha_diaspora() -> Optional[str]:
-    # 1) Shabbat API with geonameid (respects Diaspora schedule for location)
-    shabbat_url = "https://www.hebcal.com/shabbat"
-    shabbat_params = {
-        "cfg": "json",
-        "geo": "geoname",
-        "geonameid": HEBCAL_GEONAMEID,
-        "m": "50",
-        "leyning": "on",
-    }
-
+def load_users() -> List[int]:
+    if not USERS_FILE.exists():
+        return []
     try:
-        data = await http_get_json(shabbat_url, params=shabbat_params, timeout=20)
-    except Exception as e:
-        logger.warning(f"Hebcal shabbat API failed: {e}")
-        data = {}
+        return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
 
+
+def save_users(users: List[int]) -> None:
+    USERS_FILE.write_text(json.dumps(sorted(set(users)), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def register_user(user_id: int) -> None:
+    users = load_users()
+    if user_id not in users:
+        users.append(user_id)
+        save_users(users)
+
+
+def is_allowed(user_id: int) -> bool:
+    if not ADMIN_USER_ID:
+        return True
+    return str(user_id) == ADMIN_USER_ID
+
+
+def load_cache() -> Dict[str, Any]:
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_cache(cache: Dict[str, Any]) -> None:
+    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def clean_html_text(value: Any) -> str:
+    """Flatten Sefaria arrays and remove basic HTML tags."""
+    if isinstance(value, list):
+        return "\n".join(clean_html_text(x) for x in value if x)
+    if value is None:
+        return ""
+    text = str(value)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def chunk_text(text: str, limit: int = 3800) -> List[str]:
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n\n", 0, limit)
+        if split_at == -1:
+            split_at = text.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+    return chunks
+
+
+async def send_long_message(update_or_context, chat_id: int, text: str, reply_markup=None) -> None:
+    chunks = chunk_text(text)
+    for i, chunk in enumerate(chunks):
+        await update_or_context.bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup if i == len(chunks) - 1 else None,
+            disable_web_page_preview=True,
+        )
+
+
+# -------------------------
+# Hebcal / Sefaria
+# -------------------------
+
+async def get_current_parsha() -> Dict[str, Any]:
+    """
+    Hebcal Shabbat API returns the upcoming/current Shabbat reading.
+    Weekly calculations change on Sunday local time, which fits the Sunday reminder.
+    """
+    params = {
+        "cfg": "json",
+        "geo": "none",
+        "M": "on",
+    }
+    if ISRAEL:
+        params["i"] = "on"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://www.hebcal.com/shabbat", params=params, timeout=30) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    parsha_item = None
     for item in data.get("items", []):
-        if item.get("category") == "parashat" and item.get("title"):
-            return item["title"].replace("Parashat ", "").strip()
-
-    # 2) Fallback: calendar for next 21 days
-    cal_url = "https://www.hebcal.com/hebcal"
-    today = date.today()
-    end = today + timedelta(days=21)
-    cal_params = {
-        "v": "1",
-        "cfg": "json",
-        "start": today.isoformat(),
-        "end": end.isoformat(),
-        "ss": "on",
-        "maj": "off",
-        "min": "off",
-        "mod": "off",
-        "nx": "off",
-    }
-    try:
-        data2 = await http_get_json(cal_url, params=cal_params, timeout=20)
-    except Exception as e:
-        logger.warning(f"Hebcal calendar API failed: {e}")
-        return None
-
-    for item in data2.get("items", []):
-        if item.get("category") == "parashat" and item.get("title"):
-            return item["title"].replace("Parashat ", "").strip()
-
-    return None
-
-# ---------------- SEFARIA (RAW TEXT) ----------------
-
-async def sefaria_get_text_by_ref(ref: str) -> str:
-    encoded_ref = quote(ref, safe="")
-    url = f"https://www.sefaria.org/api/texts/{encoded_ref}"
-    params = {"lang": "he", "context": "0", "commentary": "0"}
-
-    data = await http_get_json(url, params=params, timeout=30)
-
-    chunks: List[str] = []
-    txt = data.get("text")
-    if isinstance(txt, list):
-        for section in txt:
-            if isinstance(section, list):
-                chunks.append(" ".join([str(x) for x in section if x]))
-            elif section:
-                chunks.append(str(section))
-
-    joined = " ".join(chunks).strip()
-    if not joined:
-        raise RuntimeError(f"Sefaria returned empty text for ref='{ref}'")
-    return joined[:20000]
-
-async def sefaria_try_parsha_text(parsha_name: str) -> str:
-    candidates = [
-        f"Torah, {parsha_name}",
-        parsha_name,
-        f"Parashat {parsha_name}",
-    ]
-    last_err = None
-    for ref in candidates:
-        try:
-            return await sefaria_get_text_by_ref(ref)
-        except Exception as e:
-            last_err = e
-            logger.warning(f"Sefaria ref failed: {ref} -> {e}")
-
-    # calendars fallback (diaspora=1)
-    cal = await http_get_json("https://www.sefaria.org/api/calendars", params={"diaspora": "1"}, timeout=25)
-    items = cal.get("calendar_items") or cal.get("items") or []
-    ref_from_calendar = None
-    for it in items:
-        title = (it.get("title") or it.get("displayValue") or "").lower()
-        if "parash" in title or "parsha" in title or "hashavua" in title:
-            ref_from_calendar = it.get("ref") or it.get("displayRef") or it.get("anchorRef")
-            if ref_from_calendar:
-                break
-    if ref_from_calendar:
-        return await sefaria_get_text_by_ref(ref_from_calendar)
-
-    raise RuntimeError(f"Sefaria failed for '{parsha_name}'. Last: {last_err}")
-
-# ---------------- OPENAI WITH FALLBACK ----------------
-
-async def openai_chat_with_fallback(system_prompt: str, user_prompt: str, temperature: float, timeout_s: int) -> str:
-    last_err = None
-    for model in MODEL_CHAIN:
-        try:
-            resp = await openai_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                timeout=timeout_s,
-            )
-            out = (resp.choices[0].message.content or "").strip()
-            if not out:
-                raise RuntimeError(f"Empty response from model {model}")
-            logger.info(f"OpenAI used model: {model}")
-            return out
-        except Exception as e:
-            last_err = e
-            logger.warning(f"OpenAI failed for {model}: {e}")
-            continue
-    raise RuntimeError(f"All OpenAI models failed. Last error: {last_err}")
-
-# ---------------- STEP 1: KEY EVENTS (INTERNAL) ----------------
-
-async def extract_key_events(parsha_text: str) -> str:
-    prompt = f"""
-Текст главы (сырьё):
-{parsha_text}
-
-Сделай 8-12 ключевых событий/заповедей в правильном порядке.
-Только события. Без объяснений. Без нумерации.
-"""
-    return await openai_chat_with_fallback(
-        system_prompt=SYSTEM_PROMPT_EXTRACT,
-        user_prompt=prompt,
-        temperature=0.1,
-        timeout_s=40,
-    )
-
-# ---------------- STEP 2: FINAL POST ----------------
-
-async def generate_post(parsha_name: str, key_events: str, parsha_text: str) -> str:
-    # Передаем и "опору" (key_events), и сырьё (чтобы точнее, но без выдумок)
-    prompt = f"""
-Название недельной главы: {parsha_name}
-
-Опорные ключевые события (только как опора, порядок важен):
-{key_events}
-
-Текст главы (сырьё, для проверки фактов, без цитирования):
-{parsha_text}
-
-Напиши финальный пост строго по правилам.
-"""
-    return await openai_chat_with_fallback(
-        system_prompt=SYSTEM_PROMPT_MAIN,
-        user_prompt=prompt,
-        temperature=0.45,
-        timeout_s=55,
-    )
-
-# ---------------- VALIDATION + REWRITE ----------------
-
-BANNED_VISIBLE = [
-    "самопроверка", "шаг 1", "шаг 2", "план", "чеклист",
-    "structure", "по структуре", "по пунктам", "по списку",
-]
-BANNED_WRONG_NAMES = ["моисей", "господь", "библия", "табернакль"]
-BANNED_HUMANIZING = ["разоз", "передумал", "обид", "в ярости", "взбес", "расстроил"]
-BANNED_HEAVY = ["божественная кара", "беззаконие", "курительная смесь"]
-
-def estimate_read_seconds(text: str) -> int:
-    t = re.sub(r"\s+", " ", (text or "").strip())
-    if not t:
-        return 0
-    return max(10, int(len(t) / 14))
-
-def validate_post(text: str, parsha_name: str) -> List[str]:
-    issues = []
-    low = (text or "").lower().strip()
-
-    if not low.startswith("📖 недельная глава:"):
-        issues.append("Нет заголовка '📖 Недельная глава: ...' в начале.")
-
-    if parsha_name.lower() not in low:
-        issues.append("В тексте не видно названия главы.")
-
-    for w in BANNED_VISIBLE:
-        if w in low:
-            issues.append(f"Запрещенное слово/фраза: {w}")
-
-    for w in BANNED_WRONG_NAMES:
-        if w in low:
-            issues.append(f"Нежелательная лексика (заменить): {w}")
-
-    for w in BANNED_HUMANIZING:
-        if w in low:
-            issues.append("Слишком человеческое описание Всевышнего (убрать/переписать).")
+        if item.get("category") == "parashat":
+            parsha_item = item
             break
 
-    for w in BANNED_HEAVY:
-        if w in low:
-            issues.append(f"Тяжелая формулировка (упростить): {w}")
+    if not parsha_item:
+        raise RuntimeError("Hebcal did not return a parsha item.")
 
-    if "всевышн" not in low:
-        issues.append("Не использовано слово 'Всевышний' (лучше использовать).")
+    title = parsha_item.get("title", "").replace("Parashat ", "").strip()
+    hebrew = parsha_item.get("hebrew", "")
+    leyning = parsha_item.get("leyning", {}) or {}
+    torah_ref = leyning.get("torah", "")  # e.g. "Exodus 30:11-34:35"
 
-    # Telegram length target 45-90 sec
-    sec = estimate_read_seconds(text)
-    if sec > 110:
-        issues.append(f"Слишком длинно (оценка {sec} сек). Сократить.")
-    if sec < 30:
-        issues.append(f"Слишком коротко (оценка {sec} сек). Чуть добавить связности, без новых деталей.")
+    return {
+        "title": title,
+        "hebrew": hebrew,
+        "torah_ref": torah_ref,
+        "date": data.get("date", ""),
+        "raw": parsha_item,
+    }
 
-    return issues
 
-async def rewrite_post(parsha_name: str, key_events: str, parsha_text: str, draft: str, issues: List[str]) -> str:
-    prompt = f"""
-Название недельной главы: {parsha_name}
+async def fetch_sefaria_text(tref: str, lang: str = "en") -> str:
+    """
+    Fetch text from Sefaria legacy endpoint for simplicity.
+    No API key required.
+    """
+    if not tref:
+        raise RuntimeError("Missing Sefaria reference.")
 
-Опорные ключевые события (порядок важен):
-{key_events}
+    url = f"https://www.sefaria.org/api/texts/{quote(tref)}"
+    params = {
+        "lang": lang,
+        "commentary": "0",
+        "context": "0",
+    }
 
-Текст главы (сырьё):
-{parsha_text}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, timeout=45) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
 
-Текущий текст (его нужно переписать заново):
-{draft}
+    if lang == "he":
+        text = clean_html_text(data.get("he", ""))
+    else:
+        text = clean_html_text(data.get("text", ""))
 
-Исправь строго по проблемам:
-{json.dumps(issues, ensure_ascii=False)}
+    if not text:
+        # fallback to English if selected language is unavailable
+        if lang != "en":
+            return await fetch_sefaria_text(tref, "en")
+        raise RuntimeError(f"Sefaria returned empty text for {tref}")
+
+    return text
+
+
+async def get_parsha_package() -> Dict[str, str]:
+    cache = load_cache()
+    parsha = await get_current_parsha()
+    cache_key = f"{parsha['title']}|{parsha['torah_ref']}|{TORAH_LANG}|{ISRAEL}"
+
+    if cache.get("key") == cache_key:
+        return cache["data"]
+
+    torah_ref = parsha["torah_ref"]
+    if not torah_ref:
+        # fallback: Sefaria sometimes accepts "Parashat Ki Tisa"
+        torah_ref = f"Parashat {parsha['title']}"
+
+    full_text = await fetch_sefaria_text(torah_ref, TORAH_LANG)
+
+    data = {
+        "title": parsha["title"],
+        "hebrew": parsha.get("hebrew", ""),
+        "torah_ref": torah_ref,
+        "full_text": full_text,
+    }
+    save_cache({"key": cache_key, "data": data})
+    return data
+
+
+async def fetch_rashi_commentary(torah_ref: str) -> str:
+    """
+    Tries to fetch Rashi for the weekly Torah range.
+    If Sefaria cannot return it cleanly, the bot will explain that.
+    """
+    tref = f"Rashi on {torah_ref}"
+    try:
+        return await fetch_sefaria_text(tref, "en")
+    except Exception:
+        return ""
+
+
+# -------------------------
+# OpenAI prompts
+# -------------------------
+
+SYSTEM_RU = """
+Ты — преподаватель Торы. Твоя задача — помогать изучать недельную главу точно, уважительно и без выдумок.
 
 Правила:
-- не добавляй новых событий
-- не выводи внутренние проверки
-- соблюдай стиль и имена
-- сделай текст читаемым за 45-90 секунд
-"""
-    return await openai_chat_with_fallback(
-        system_prompt=SYSTEM_PROMPT_MAIN,
-        user_prompt=prompt,
-        temperature=0.25,
-        timeout_s=55,
+- Работай только с текстом, который тебе дали.
+- Не добавляй события, которых нет в тексте.
+- Не придумывай цитаты мудрецов.
+- Если не уверен — пиши более общо.
+- Пиши на русском языке.
+- Используй еврейские термины: Моше, Аарон, Всевышний, Мишкан, Синай, Песах.
+- Не используй христианские термины вроде "Пасха" или "Скиния".
+- Стиль: простой, ясный, уважительный, без академического тона.
+""".strip()
+
+
+async def ask_ai(task: str, source_text: str, extra: str = "") -> str:
+    # Keep source bounded for cost and context. For long parshiot, summary still works on selected text.
+    max_chars = 52000
+    clipped = source_text[:max_chars]
+
+    prompt = f"""
+ЗАДАНИЕ:
+{task}
+
+ДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА:
+{extra}
+
+ТЕКСТ ДЛЯ РАБОТЫ:
+{clipped}
+""".strip()
+
+    response = await openai_client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "system", "content": SYSTEM_RU},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.output_text.strip()
+
+
+async def generate_summary(full_text: str) -> str:
+    return await ask_ai(
+        task="Сделай краткий, но точный пересказ недельной главы Торы.",
+        source_text=full_text,
+        extra="""
+- Не пропускай главные события.
+- Не добавляй объяснения и мидраши.
+- Объём: 8-12 коротких предложений.
+- Пиши так, чтобы это было удобно читать в Telegram.
+""",
     )
 
-# ---------------- TELEGRAM COMMANDS ----------------
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Шалом.\n\n"
-        "Я присылаю краткое и точное объяснение недельной главы Торы.\n"
-        "Команда: /parsha"
+async def generate_lesson(full_text: str) -> str:
+    return await ask_ai(
+        task="Объясни смысл и главный урок этой недельной главы.",
+        source_text=full_text,
+        extra="""
+- Сначала назови главную духовную идею главы.
+- Потом объясни её простым языком.
+- Заверши 2-3 предложениями о том, как это применить в жизни.
+- Без морализаторства и без пугающих формулировок.
+""",
     )
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/parsha - получить недельную главу\n"
-        "/debug - показать последнюю ошибку\n"
-        "/help - помощь\n"
+
+async def generate_questions(full_text: str) -> str:
+    return await ask_ai(
+        task="Составь вопросы для размышления по недельной главе.",
+        source_text=full_text,
+        extra="""
+- Дай 5-7 вопросов.
+- Вопросы должны быть глубокими, но понятными.
+- Вопросы должны опираться только на текст главы.
+- Не добавляй ответы.
+""",
     )
 
-async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def generate_rashi_explanation(full_text: str, rashi_text: str) -> str:
+    if not rashi_text.strip():
+        return (
+            "📚 Комментарий Раши\n\n"
+            "Я не смог получить комментарий Раши из источника для этой главы. "
+            "Лучше не генерировать его из памяти, чтобы не приписать Раши то, чего он не говорил."
+        )
+
+    combined = f"""
+ТЕКСТ ГЛАВЫ:
+{full_text[:28000]}
+
+КОММЕНТАРИИ РАШИ:
+{rashi_text[:28000]}
+""".strip()
+
+    return await ask_ai(
+        task="Выбери 2-3 важных комментария Раши к этой главе и объясни их простым языком.",
+        source_text=combined,
+        extra="""
+- Не придумывай цитаты Раши.
+- Используй только предоставленный текст комментариев.
+- Не перегружай деталями.
+- Формат: короткий заголовок и объяснение простым языком.
+""",
+    )
+
+
+# -------------------------
+# Telegram UI
+# -------------------------
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📜 Полная глава", callback_data="full"),
+        ],
+        [
+            InlineKeyboardButton("✂️ Кратко", callback_data="summary"),
+            InlineKeyboardButton("💡 Смысл и урок", callback_data="lesson"),
+        ],
+        [
+            InlineKeyboardButton("📚 Раши", callback_data="rashi"),
+            InlineKeyboardButton("❓ Вопросы", callback_data="questions"),
+        ],
+    ])
+
+
+async def build_intro_message() -> str:
+    data = await get_parsha_package()
+    title = html.escape(data["title"])
+    hebrew = html.escape(data.get("hebrew", ""))
+    ref = html.escape(data.get("torah_ref", ""))
+
+    hebrew_line = f"\n{hebrew}" if hebrew else ""
+    ref_line = f"\n\nИсточник: {ref}" if ref else ""
+
+    return (
+        f"📖 <b>Недельная глава: {title}</b>{hebrew_line}\n\n"
+        f"Выбери, что открыть:{ref_line}"
+    )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    await update.message.reply_text(get_last_error(user_id))
+    if not is_allowed(user_id):
+        await update.message.reply_text("У тебя нет доступа к этому боту.")
+        return
 
-async def cmd_parsha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(user_id)
+    await update.message.reply_text(
+        "Готово. Я буду присылать недельную главу по воскресеньям.\n\n"
+        "Для теста нажми /send_now"
+    )
+
+
+async def send_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    chat = update.effective_chat
-    typing_task = asyncio.create_task(send_typing(chat, duration_seconds=70))
+    if not is_allowed(user_id):
+        await update.message.reply_text("У тебя нет доступа к этому боту.")
+        return
+
+    register_user(user_id)
+    msg = await build_intro_message()
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not is_allowed(user_id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    await query.answer("Готовлю...")
+
+    data = await get_parsha_package()
+    action = query.data
 
     try:
-        set_last_error(user_id, f"OK: started /parsha. MODEL_CHAIN={MODEL_CHAIN}")
+        if action == "full":
+            text = f"📜 <b>Полная глава: {html.escape(data['title'])}</b>\n\n{html.escape(data['full_text'])}"
+            await send_long_message(context, query.message.chat_id, text)
 
-        parsha_name = await get_current_parsha_diaspora()
-        if not parsha_name:
-            typing_task.cancel()
-            set_last_error(user_id, "Hebcal: parasha not found.")
-            await chat.send_message("Не удалось определить текущую недельную главу. Попробуй чуть позже.")
-            return
+        elif action == "summary":
+            result = await generate_summary(data["full_text"])
+            await send_long_message(context, query.message.chat_id, f"✂️ <b>Кратко</b>\n\n{html.escape(result)}")
 
-        parsha_text = await sefaria_try_parsha_text(parsha_name)
+        elif action == "lesson":
+            result = await generate_lesson(data["full_text"])
+            await send_long_message(context, query.message.chat_id, f"💡 <b>Смысл и урок</b>\n\n{html.escape(result)}")
 
-        key_events = await extract_key_events(parsha_text)
+        elif action == "questions":
+            result = await generate_questions(data["full_text"])
+            await send_long_message(context, query.message.chat_id, f"❓ <b>Вопросы</b>\n\n{html.escape(result)}")
 
-        draft = await generate_post(parsha_name, key_events, parsha_text)
+        elif action == "rashi":
+            rashi = await fetch_rashi_commentary(data["torah_ref"])
+            result = await generate_rashi_explanation(data["full_text"], rashi)
+            await send_long_message(context, query.message.chat_id, html.escape(result))
 
-        # Validate and retry up to 2 rewrites
-        for attempt in range(3):
-            issues = validate_post(draft, parsha_name)
-            if not issues:
-                break
-            if attempt == 2:
-                logger.warning(f"Validator issues remain: {issues}")
-                break
-            draft = await rewrite_post(parsha_name, key_events, parsha_text, draft, issues)
-
-        typing_task.cancel()
-        set_last_error(user_id, "OK: success")
-
-        for part in split_text(draft):
-            await chat.send_message(part)
+        else:
+            await query.message.reply_text("Неизвестная кнопка.")
 
     except Exception as e:
-        typing_task.cancel()
-        msg = f"ERROR: {repr(e)}"
-        set_last_error(user_id, msg)
-        logger.exception(msg)
-        await chat.send_message("Техническая ошибка. Напиши /debug - покажу подробности.")
+        await query.message.reply_text(
+            f"Ошибка при подготовке текста: {html.escape(str(e))}",
+            parse_mode=ParseMode.HTML,
+        )
 
-# ---------------- BOT INIT ----------------
 
-async def post_init(app):
-    commands = [
-        BotCommand("start", "Начать"),
-        BotCommand("parsha", "Недельная глава"),
-        BotCommand("help", "Помощь"),
-        BotCommand("debug", "Показать ошибку"),
-    ]
-    await app.bot.set_my_commands(commands)
+async def weekly_broadcast(app: Application) -> None:
+    users = load_users()
+    if not users:
+        return
 
-def main():
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
+    try:
+        msg = await build_intro_message()
+    except Exception as e:
+        msg = f"Не смог получить недельную главу: {html.escape(str(e))}"
+
+    for user_id in users:
+        try:
+            await app.bot.send_message(
+                chat_id=user_id,
+                text=msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            # Keep broadcasting to other users
+            pass
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("send_now", send_now))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    scheduler = AsyncIOScheduler(timezone=SCHEDULE_TZ)
+    scheduler.add_job(
+        weekly_broadcast,
+        trigger="cron",
+        day_of_week=SCHEDULE_DAY_OF_WEEK,
+        hour=SCHEDULE_HOUR,
+        minute=SCHEDULE_MINUTE,
+        args=[app],
+        id="weekly_parsha_broadcast",
+        replace_existing=True,
+    )
+    scheduler.start()
+
+    print(
+        f"TorahBot started. Weekly schedule: {SCHEDULE_DAY_OF_WEEK} "
+        f"{SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} {SCHEDULE_TZ}"
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("parsha", cmd_parsha))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    logger.info(f"Bot started. MODEL_CHAIN={MODEL_CHAIN}. HEBCAL_GEONAMEID={HEBCAL_GEONAMEID}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0)
 
 if __name__ == "__main__":
     main()
