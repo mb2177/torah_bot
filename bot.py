@@ -14,8 +14,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from torah_ru_loader import get_parsha_ru
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -33,6 +31,9 @@ ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
 USERS_FILE = Path("users.json")
 CACHE_FILE = Path("cache.json")
+
+TORAH_FILE = Path("torah_ru_full.json")
+PARSHA_FILE = Path("parsha_map.json")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -80,6 +81,13 @@ def save_cache(cache: Dict[str, Any]) -> None:
         json.dumps(cache, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise RuntimeError(f"Файл не найден: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def clean_html_text(value: Any) -> str:
@@ -181,6 +189,58 @@ async def get_current_parsha() -> Dict[str, Any]:
     }
 
 
+def get_parsha_text_from_local(parsha_name: str) -> Dict[str, str]:
+    torah = load_json(TORAH_FILE)
+    parsha_map = load_json(PARSHA_FILE)
+
+    if parsha_name not in parsha_map:
+        raise RuntimeError(
+            f"Недельная глава '{parsha_name}' не найдена в parsha_map.json"
+        )
+
+    parsha = parsha_map[parsha_name]
+    title_ru = parsha.get("title_ru", parsha_name)
+
+    result = [f"📖 Недельная глава: {title_ru}", ""]
+
+    references = []
+
+    for r in parsha["ranges"]:
+        book = r["book"]
+        from_chapter = int(r["from_chapter"])
+        from_verse = int(r["from_verse"])
+        to_chapter = int(r["to_chapter"])
+        to_verse = int(r["to_verse"])
+
+        references.append(
+            f"{book} {from_chapter}:{from_verse}-{to_chapter}:{to_verse}"
+        )
+
+        for chapter_num in range(from_chapter, to_chapter + 1):
+            chapter = torah["books"][book]["chapters"][str(chapter_num)]
+            verses = chapter["verses"]
+
+            start = from_verse if chapter_num == from_chapter else 1
+            end = to_verse if chapter_num == to_chapter else max(map(int, verses.keys()))
+
+            result.append(f"Глава {chapter_num}")
+            result.append("")
+
+            for verse_num in range(start, end + 1):
+                verse = verses.get(str(verse_num))
+                if verse:
+                    result.append(f"{verse_num}. {verse}")
+
+            result.append("")
+
+    return {
+        "title": parsha_name,
+        "title_ru": title_ru,
+        "torah_ref": " + ".join(references),
+        "full_text": "\n".join(result).strip(),
+    }
+
+
 async def fetch_sefaria_text(tref: str, lang: str = "en") -> str:
     if not tref:
         raise RuntimeError("Missing Sefaria reference.")
@@ -209,62 +269,43 @@ async def fetch_sefaria_text(tref: str, lang: str = "en") -> str:
 
 
 async def get_parsha_package() -> Dict[str, str]:
-    """
-    1. Hebcal determines this week's parsha.
-    2. Bot tries to load the Russian parsha text from torah_ru_parshiot.json.
-    3. If unavailable, fallback to Sefaria.
-    Supports double portions like Achrei Mot-Kedoshim.
-    """
     cache = load_cache()
     parsha = await get_current_parsha()
 
     title = parsha["title"]
-    cache_key = f"RU|{title}|{parsha.get('torah_ref', '')}|{ISRAEL}"
+    cache_key = f"LOCAL_RU|{title}|{parsha.get('torah_ref', '')}|{ISRAEL}"
 
     if cache.get("key") == cache_key:
         return cache["data"]
 
-    titles = [t.strip() for t in title.split("-") if t.strip()]
-    found_parts = []
+    try:
+        local_data = get_parsha_text_from_local(title)
 
-    for t in titles:
-        item = get_parsha_ru(t)
+        data = {
+            "title": title,
+            "title_ru": local_data["title_ru"],
+            "hebrew": parsha.get("hebrew", ""),
+            "torah_ref": local_data["torah_ref"],
+            "full_text": local_data["full_text"],
+        }
 
-        if not item:
-            torah_ref = parsha.get("torah_ref") or f"Parashat {title}"
-            full_text = await fetch_sefaria_text(torah_ref, TORAH_LANG)
+        save_cache({"key": cache_key, "data": data})
+        return data
 
-            data = {
-                "title": title,
-                "title_ru": title,
-                "hebrew": parsha.get("hebrew", ""),
-                "torah_ref": torah_ref,
-                "full_text": full_text,
-            }
+    except Exception:
+        torah_ref = parsha.get("torah_ref") or f"Parashat {title}"
+        full_text = await fetch_sefaria_text(torah_ref, TORAH_LANG)
 
-            save_cache({"key": cache_key, "data": data})
-            return data
+        data = {
+            "title": title,
+            "title_ru": title,
+            "hebrew": parsha.get("hebrew", ""),
+            "torah_ref": torah_ref,
+            "full_text": full_text,
+        }
 
-        found_parts.append(item)
-
-    full_text = "\n\n".join(
-        f"📖 {part['title_ru']}\n{part['reference_ru']}\n\n{part['text_ru']}"
-        for part in found_parts
-    )
-
-    refs = " + ".join(part["reference_ru"] for part in found_parts)
-    ru_titles = " + ".join(part["title_ru"] for part in found_parts)
-
-    data = {
-        "title": title,
-        "title_ru": ru_titles,
-        "hebrew": parsha.get("hebrew", ""),
-        "torah_ref": refs,
-        "full_text": full_text,
-    }
-
-    save_cache({"key": cache_key, "data": data})
-    return data
+        save_cache({"key": cache_key, "data": data})
+        return data
 
 
 async def fetch_rashi_commentary(torah_ref: str) -> str:
@@ -281,7 +322,7 @@ SYSTEM_RU = """
 
 Правила:
 - Работай только с текстом, который тебе дали.
-- Не добавляй события, которых нет в тексте.
+- Не добавляй событий, которых нет в тексте.
 - Не придумывай цитаты мудрецов.
 - Если не уверен — пиши более общо.
 - Пиши на русском языке.
@@ -292,10 +333,6 @@ SYSTEM_RU = """
 
 
 async def ask_ai(task: str, source_text: str, extra: str = "") -> str:
-    """
-    Uses chat.completions.
-    Fixes error: 'AsyncOpenAI' object has no attribute 'responses'
-    """
     max_chars = 52000
     clipped = source_text[:max_chars]
 
