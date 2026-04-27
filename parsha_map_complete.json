@@ -1,0 +1,698 @@
+{
+  "Bereshit": {
+    "title_ru": "Берешит",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 1,
+        "from_verse": 1,
+        "to_chapter": 6,
+        "to_verse": 8
+      }
+    ]
+  },
+  "Noach": {
+    "title_ru": "Ноах",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 6,
+        "from_verse": 9,
+        "to_chapter": 11,
+        "to_verse": 32
+      }
+    ]
+  },
+  "Lech-Lecha": {
+    "title_ru": "Лех-Леха",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 12,
+        "from_verse": 1,
+        "to_chapter": 17,
+        "to_verse": 27
+      }
+    ]
+  },
+  "Vayera": {
+    "title_ru": "Ваера",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 18,
+        "from_verse": 1,
+        "to_chapter": 22,
+        "to_verse": 24
+      }
+    ]
+  },
+  "Chayei Sara": {
+    "title_ru": "Хаей Сара",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 23,
+        "from_verse": 1,
+        "to_chapter": 25,
+        "to_verse": 18
+      }
+    ]
+  },
+  "Toldot": {
+    "title_ru": "Толдот",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 25,
+        "from_verse": 19,
+        "to_chapter": 28,
+        "to_verse": 9
+      }
+    ]
+  },
+  "Vayetzei": {
+    "title_ru": "Ваецэ",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 28,
+        "from_verse": 10,
+        "to_chapter": 32,
+        "to_verse": 3
+      }
+    ]
+  },
+  "Vayishlach": {
+    "title_ru": "Ваишлах",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 32,
+        "from_verse": 4,
+        "to_chapter": 36,
+        "to_verse": 43
+      }
+    ]
+  },
+  "Vayeshev": {
+    "title_ru": "Ваешев",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 37,
+        "from_verse": 1,
+        "to_chapter": 40,
+        "to_verse": 23
+      }
+    ]
+  },
+  "Miketz": {
+    "title_ru": "Микец",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 41,
+        "from_verse": 1,
+        "to_chapter": 44,
+        "to_verse": 17
+      }
+    ]
+  },
+  "Vayigash": {
+    "title_ru": "Ваигаш",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 44,
+        "from_verse": 18,
+        "to_chapter": 47,
+        "to_verse": 27
+      }
+    ]
+  },
+  "Vayechi": {
+    "title_ru": "Ваехи",
+    "ranges": [
+      {
+        "book": "Bereshit",
+        "from_chapter": 47,
+        "from_verse": 28,
+        "to_chapter": 50,
+        "to_verse": 26
+      }
+    ]
+  },
+  "Shemot": {
+    "title_ru": "Шемот",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 1,
+        "from_verse": 1,
+        "to_chapter": 6,
+        "to_verse": 1
+      }
+    ]
+  },
+  "Vaera": {
+    "title_ru": "Ваэра",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 6,
+        "from_verse": 2,
+        "to_chapter": 9,
+        "to_verse": 35
+      }
+    ]
+  },
+  "Bo": {
+    "title_ru": "Бо",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 10,
+        "from_verse": 1,
+        "to_chapter": 13,
+        "to_verse": 16
+      }
+    ]
+  },
+  "Beshalach": {
+    "title_ru": "Бешалах",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 13,
+        "from_verse": 17,
+        "to_chapter": 17,
+        "to_verse": 16
+      }
+    ]
+  },
+  "Yitro": {
+    "title_ru": "Итро",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 18,
+        "from_verse": 1,
+        "to_chapter": 20,
+        "to_verse": 23
+      }
+    ]
+  },
+  "Mishpatim": {
+    "title_ru": "Мишпатим",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 21,
+        "from_verse": 1,
+        "to_chapter": 24,
+        "to_verse": 18
+      }
+    ]
+  },
+  "Terumah": {
+    "title_ru": "Трума",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 25,
+        "from_verse": 1,
+        "to_chapter": 27,
+        "to_verse": 19
+      }
+    ]
+  },
+  "Tetzaveh": {
+    "title_ru": "Тецаве",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 27,
+        "from_verse": 20,
+        "to_chapter": 30,
+        "to_verse": 10
+      }
+    ]
+  },
+  "Ki Tisa": {
+    "title_ru": "Ки Тиса",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 30,
+        "from_verse": 11,
+        "to_chapter": 34,
+        "to_verse": 35
+      }
+    ]
+  },
+  "Vayakhel": {
+    "title_ru": "Ваякель",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 35,
+        "from_verse": 1,
+        "to_chapter": 38,
+        "to_verse": 20
+      }
+    ]
+  },
+  "Pekudei": {
+    "title_ru": "Пекудей",
+    "ranges": [
+      {
+        "book": "Shemot",
+        "from_chapter": 38,
+        "from_verse": 21,
+        "to_chapter": 40,
+        "to_verse": 38
+      }
+    ]
+  },
+  "Vayikra": {
+    "title_ru": "Ваикра",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 1,
+        "from_verse": 1,
+        "to_chapter": 5,
+        "to_verse": 26
+      }
+    ]
+  },
+  "Tzav": {
+    "title_ru": "Цав",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 6,
+        "from_verse": 1,
+        "to_chapter": 8,
+        "to_verse": 36
+      }
+    ]
+  },
+  "Shemini": {
+    "title_ru": "Шмини",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 9,
+        "from_verse": 1,
+        "to_chapter": 11,
+        "to_verse": 47
+      }
+    ]
+  },
+  "Tazria": {
+    "title_ru": "Тазрия",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 12,
+        "from_verse": 1,
+        "to_chapter": 13,
+        "to_verse": 59
+      }
+    ]
+  },
+  "Metzora": {
+    "title_ru": "Мецора",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 14,
+        "from_verse": 1,
+        "to_chapter": 15,
+        "to_verse": 33
+      }
+    ]
+  },
+  "Achrei Mot": {
+    "title_ru": "Ахарей Мот",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 16,
+        "from_verse": 1,
+        "to_chapter": 18,
+        "to_verse": 30
+      }
+    ]
+  },
+  "Kedoshim": {
+    "title_ru": "Кдошим",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 19,
+        "from_verse": 1,
+        "to_chapter": 20,
+        "to_verse": 27
+      }
+    ]
+  },
+  "Emor": {
+    "title_ru": "Эмор",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 21,
+        "from_verse": 1,
+        "to_chapter": 24,
+        "to_verse": 23
+      }
+    ]
+  },
+  "Behar": {
+    "title_ru": "Беhар",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 25,
+        "from_verse": 1,
+        "to_chapter": 26,
+        "to_verse": 2
+      }
+    ]
+  },
+  "Bechukotai": {
+    "title_ru": "Бехукотай",
+    "ranges": [
+      {
+        "book": "Vayikra",
+        "from_chapter": 26,
+        "from_verse": 3,
+        "to_chapter": 27,
+        "to_verse": 34
+      }
+    ]
+  },
+  "Bamidbar": {
+    "title_ru": "Бемидбар",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 1,
+        "from_verse": 1,
+        "to_chapter": 4,
+        "to_verse": 20
+      }
+    ]
+  },
+  "Nasso": {
+    "title_ru": "Насо",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 4,
+        "from_verse": 21,
+        "to_chapter": 7,
+        "to_verse": 89
+      }
+    ]
+  },
+  "Beha'alotcha": {
+    "title_ru": "Беhаалотха",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 8,
+        "from_verse": 1,
+        "to_chapter": 12,
+        "to_verse": 16
+      }
+    ]
+  },
+  "Sh'lach": {
+    "title_ru": "Шлах",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 13,
+        "from_verse": 1,
+        "to_chapter": 15,
+        "to_verse": 41
+      }
+    ]
+  },
+  "Shelach": {
+    "title_ru": "Шлах",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 13,
+        "from_verse": 1,
+        "to_chapter": 15,
+        "to_verse": 41
+      }
+    ]
+  },
+  "Korach": {
+    "title_ru": "Корах",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 16,
+        "from_verse": 1,
+        "to_chapter": 18,
+        "to_verse": 32
+      }
+    ]
+  },
+  "Chukat": {
+    "title_ru": "Хукат",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 19,
+        "from_verse": 1,
+        "to_chapter": 22,
+        "to_verse": 1
+      }
+    ]
+  },
+  "Balak": {
+    "title_ru": "Балак",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 22,
+        "from_verse": 2,
+        "to_chapter": 25,
+        "to_verse": 9
+      }
+    ]
+  },
+  "Pinchas": {
+    "title_ru": "Пинхас",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 25,
+        "from_verse": 10,
+        "to_chapter": 30,
+        "to_verse": 1
+      }
+    ]
+  },
+  "Matot": {
+    "title_ru": "Матот",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 30,
+        "from_verse": 2,
+        "to_chapter": 32,
+        "to_verse": 42
+      }
+    ]
+  },
+  "Masei": {
+    "title_ru": "Масей",
+    "ranges": [
+      {
+        "book": "Bamidbar",
+        "from_chapter": 33,
+        "from_verse": 1,
+        "to_chapter": 36,
+        "to_verse": 13
+      }
+    ]
+  },
+  "Devarim": {
+    "title_ru": "Деварим",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 1,
+        "from_verse": 1,
+        "to_chapter": 3,
+        "to_verse": 22
+      }
+    ]
+  },
+  "Vaetchanan": {
+    "title_ru": "Ваэтханан",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 3,
+        "from_verse": 23,
+        "to_chapter": 7,
+        "to_verse": 11
+      }
+    ]
+  },
+  "Eikev": {
+    "title_ru": "Экев",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 7,
+        "from_verse": 12,
+        "to_chapter": 11,
+        "to_verse": 25
+      }
+    ]
+  },
+  "Re'eh": {
+    "title_ru": "Реэ",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 11,
+        "from_verse": 26,
+        "to_chapter": 16,
+        "to_verse": 17
+      }
+    ]
+  },
+  "Reeh": {
+    "title_ru": "Реэ",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 11,
+        "from_verse": 26,
+        "to_chapter": 16,
+        "to_verse": 17
+      }
+    ]
+  },
+  "Shoftim": {
+    "title_ru": "Шофтим",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 16,
+        "from_verse": 18,
+        "to_chapter": 21,
+        "to_verse": 9
+      }
+    ]
+  },
+  "Ki Teitzei": {
+    "title_ru": "Ки Тецэ",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 21,
+        "from_verse": 10,
+        "to_chapter": 25,
+        "to_verse": 19
+      }
+    ]
+  },
+  "Ki Tavo": {
+    "title_ru": "Ки Таво",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 26,
+        "from_verse": 1,
+        "to_chapter": 29,
+        "to_verse": 8
+      }
+    ]
+  },
+  "Nitzavim": {
+    "title_ru": "Ницавим",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 29,
+        "from_verse": 9,
+        "to_chapter": 30,
+        "to_verse": 20
+      }
+    ]
+  },
+  "Vayeilech": {
+    "title_ru": "Ваелех",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 31,
+        "from_verse": 1,
+        "to_chapter": 31,
+        "to_verse": 30
+      }
+    ]
+  },
+  "Ha'Azinu": {
+    "title_ru": "hаазину",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 32,
+        "from_verse": 1,
+        "to_chapter": 32,
+        "to_verse": 52
+      }
+    ]
+  },
+  "Haazinu": {
+    "title_ru": "hаазину",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 32,
+        "from_verse": 1,
+        "to_chapter": 32,
+        "to_verse": 52
+      }
+    ]
+  },
+  "V'Zot HaBerachah": {
+    "title_ru": "Ве-зот hа-Браха",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 33,
+        "from_verse": 1,
+        "to_chapter": 34,
+        "to_verse": 12
+      }
+    ]
+  },
+  "Vezot Haberakhah": {
+    "title_ru": "Ве-зот hа-Браха",
+    "ranges": [
+      {
+        "book": "Devarim",
+        "from_chapter": 33,
+        "from_verse": 1,
+        "to_chapter": 34,
+        "to_verse": 12
+      }
+    ]
+  }
+}
