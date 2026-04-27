@@ -1,11 +1,9 @@
-
-import asyncio
 import html
 import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 from urllib.parse import quote
 
 import aiohttp
@@ -14,17 +12,14 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+from torah_ru_loader import get_parsha_ru
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODELS_FAST", "gpt-4.1-mini")
 
 SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Asia/Dubai")
@@ -42,10 +37,6 @@ CACHE_FILE = Path("cache.json")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
-# -------------------------
-# Storage
-# -------------------------
-
 def load_users() -> List[int]:
     if not USERS_FILE.exists():
         return []
@@ -56,7 +47,10 @@ def load_users() -> List[int]:
 
 
 def save_users(users: List[int]) -> None:
-    USERS_FILE.write_text(json.dumps(sorted(set(users)), ensure_ascii=False, indent=2), encoding="utf-8")
+    USERS_FILE.write_text(
+        json.dumps(sorted(set(users)), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def register_user(user_id: int) -> None:
@@ -82,19 +76,18 @@ def load_cache() -> Dict[str, Any]:
 
 
 def save_cache(cache: Dict[str, Any]) -> None:
-    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    CACHE_FILE.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-
-# -------------------------
-# Helpers
-# -------------------------
 
 def clean_html_text(value: Any) -> str:
-    """Flatten Sefaria arrays and remove basic HTML tags."""
     if isinstance(value, list):
         return "\n".join(clean_html_text(x) for x in value if x)
     if value is None:
         return ""
+
     text = str(value)
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
@@ -104,28 +97,41 @@ def clean_html_text(value: Any) -> str:
 
 def chunk_text(text: str, limit: int = 3800) -> List[str]:
     text = text.strip()
+
     if len(text) <= limit:
         return [text]
 
     chunks = []
+
     while text:
         if len(text) <= limit:
             chunks.append(text)
             break
+
         split_at = text.rfind("\n\n", 0, limit)
+
         if split_at == -1:
             split_at = text.rfind("\n", 0, limit)
+
         if split_at == -1:
             split_at = limit
+
         chunks.append(text[:split_at].strip())
         text = text[split_at:].strip()
+
     return chunks
 
 
-async def send_long_message(update_or_context, chat_id: int, text: str, reply_markup=None) -> None:
+async def send_long_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+) -> None:
     chunks = chunk_text(text)
+
     for i, chunk in enumerate(chunks):
-        await update_or_context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id,
             text=chunk,
             parse_mode=ParseMode.HTML,
@@ -134,29 +140,27 @@ async def send_long_message(update_or_context, chat_id: int, text: str, reply_ma
         )
 
 
-# -------------------------
-# Hebcal / Sefaria
-# -------------------------
-
 async def get_current_parsha() -> Dict[str, Any]:
-    """
-    Hebcal Shabbat API returns the upcoming/current Shabbat reading.
-    Weekly calculations change on Sunday local time, which fits the Sunday reminder.
-    """
     params = {
         "cfg": "json",
         "geo": "none",
         "M": "on",
     }
+
     if ISRAEL:
         params["i"] = "on"
 
     async with aiohttp.ClientSession() as session:
-        async with session.get("https://www.hebcal.com/shabbat", params=params, timeout=30) as resp:
+        async with session.get(
+            "https://www.hebcal.com/shabbat",
+            params=params,
+            timeout=30,
+        ) as resp:
             resp.raise_for_status()
             data = await resp.json()
 
     parsha_item = None
+
     for item in data.get("items", []):
         if item.get("category") == "parashat":
             parsha_item = item
@@ -166,28 +170,23 @@ async def get_current_parsha() -> Dict[str, Any]:
         raise RuntimeError("Hebcal did not return a parsha item.")
 
     title = parsha_item.get("title", "").replace("Parashat ", "").strip()
-    hebrew = parsha_item.get("hebrew", "")
     leyning = parsha_item.get("leyning", {}) or {}
-    torah_ref = leyning.get("torah", "")  # e.g. "Exodus 30:11-34:35"
 
     return {
         "title": title,
-        "hebrew": hebrew,
-        "torah_ref": torah_ref,
+        "hebrew": parsha_item.get("hebrew", ""),
+        "torah_ref": leyning.get("torah", ""),
         "date": data.get("date", ""),
         "raw": parsha_item,
     }
 
 
 async def fetch_sefaria_text(tref: str, lang: str = "en") -> str:
-    """
-    Fetch text from Sefaria legacy endpoint for simplicity.
-    No API key required.
-    """
     if not tref:
         raise RuntimeError("Missing Sefaria reference.")
 
     url = f"https://www.sefaria.org/api/texts/{quote(tref)}"
+
     params = {
         "lang": lang,
         "commentary": "0",
@@ -199,13 +198,9 @@ async def fetch_sefaria_text(tref: str, lang: str = "en") -> str:
             resp.raise_for_status()
             data = await resp.json()
 
-    if lang == "he":
-        text = clean_html_text(data.get("he", ""))
-    else:
-        text = clean_html_text(data.get("text", ""))
+    text = clean_html_text(data.get("he" if lang == "he" else "text", ""))
 
     if not text:
-        # fallback to English if selected language is unavailable
         if lang != "en":
             return await fetch_sefaria_text(tref, "en")
         raise RuntimeError(f"Sefaria returned empty text for {tref}")
@@ -214,45 +209,72 @@ async def fetch_sefaria_text(tref: str, lang: str = "en") -> str:
 
 
 async def get_parsha_package() -> Dict[str, str]:
+    """
+    1. Hebcal determines this week's parsha.
+    2. Bot tries to load the Russian parsha text from torah_ru_parshiot.json.
+    3. If unavailable, fallback to Sefaria.
+    Supports double portions like Achrei Mot-Kedoshim.
+    """
     cache = load_cache()
     parsha = await get_current_parsha()
-    cache_key = f"{parsha['title']}|{parsha['torah_ref']}|{TORAH_LANG}|{ISRAEL}"
+
+    title = parsha["title"]
+    cache_key = f"RU|{title}|{parsha.get('torah_ref', '')}|{ISRAEL}"
 
     if cache.get("key") == cache_key:
         return cache["data"]
 
-    torah_ref = parsha["torah_ref"]
-    if not torah_ref:
-        # fallback: Sefaria sometimes accepts "Parashat Ki Tisa"
-        torah_ref = f"Parashat {parsha['title']}"
+    titles = [t.strip() for t in title.split("-") if t.strip()]
+    found_parts = []
 
-    full_text = await fetch_sefaria_text(torah_ref, TORAH_LANG)
+    for t in titles:
+        item = get_parsha_ru(t)
+
+        if not item:
+            torah_ref = parsha.get("torah_ref") or f"Parashat {title}"
+            full_text = await fetch_sefaria_text(torah_ref, TORAH_LANG)
+
+            data = {
+                "title": title,
+                "title_ru": title,
+                "hebrew": parsha.get("hebrew", ""),
+                "torah_ref": torah_ref,
+                "full_text": full_text,
+            }
+
+            save_cache({"key": cache_key, "data": data})
+            return data
+
+        found_parts.append(item)
+
+    full_text = "\n\n".join(
+        f"📖 {part['title_ru']}\n{part['reference_ru']}\n\n{part['text_ru']}"
+        for part in found_parts
+    )
+
+    refs = " + ".join(part["reference_ru"] for part in found_parts)
+    ru_titles = " + ".join(part["title_ru"] for part in found_parts)
 
     data = {
-        "title": parsha["title"],
+        "title": title,
+        "title_ru": ru_titles,
         "hebrew": parsha.get("hebrew", ""),
-        "torah_ref": torah_ref,
+        "torah_ref": refs,
         "full_text": full_text,
     }
+
     save_cache({"key": cache_key, "data": data})
     return data
 
 
 async def fetch_rashi_commentary(torah_ref: str) -> str:
-    """
-    Tries to fetch Rashi for the weekly Torah range.
-    If Sefaria cannot return it cleanly, the bot will explain that.
-    """
     tref = f"Rashi on {torah_ref}"
+
     try:
         return await fetch_sefaria_text(tref, "en")
     except Exception:
         return ""
 
-
-# -------------------------
-# OpenAI prompts
-# -------------------------
 
 SYSTEM_RU = """
 Ты — преподаватель Торы. Твоя задача — помогать изучать недельную главу точно, уважительно и без выдумок.
@@ -270,7 +292,10 @@ SYSTEM_RU = """
 
 
 async def ask_ai(task: str, source_text: str, extra: str = "") -> str:
-    # Keep source bounded for cost and context. For long parshiot, summary still works on selected text.
+    """
+    Uses chat.completions.
+    Fixes error: 'AsyncOpenAI' object has no attribute 'responses'
+    """
     max_chars = 52000
     clipped = source_text[:max_chars]
 
@@ -285,14 +310,16 @@ async def ask_ai(task: str, source_text: str, extra: str = "") -> str:
 {clipped}
 """.strip()
 
-    response = await openai_client.responses.create(
+    response = await openai_client.chat.completions.create(
         model=OPENAI_MODEL,
-        input=[
+        messages=[
             {"role": "system", "content": SYSTEM_RU},
             {"role": "user", "content": prompt},
         ],
+        temperature=0.3,
     )
-    return response.output_text.strip()
+
+    return response.choices[0].message.content.strip()
 
 
 async def generate_summary(full_text: str) -> str:
@@ -362,29 +389,26 @@ async def generate_rashi_explanation(full_text: str, rashi_text: str) -> str:
     )
 
 
-# -------------------------
-# Telegram UI
-# -------------------------
-
 def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("📜 Полная глава", callback_data="full"),
-        ],
-        [
-            InlineKeyboardButton("✂️ Кратко", callback_data="summary"),
-            InlineKeyboardButton("💡 Смысл и урок", callback_data="lesson"),
-        ],
-        [
-            InlineKeyboardButton("📚 Раши", callback_data="rashi"),
-            InlineKeyboardButton("❓ Вопросы", callback_data="questions"),
-        ],
-    ])
+            [InlineKeyboardButton("📜 Полная глава", callback_data="full")],
+            [
+                InlineKeyboardButton("✂️ Кратко", callback_data="summary"),
+                InlineKeyboardButton("💡 Смысл и урок", callback_data="lesson"),
+            ],
+            [
+                InlineKeyboardButton("📚 Раши", callback_data="rashi"),
+                InlineKeyboardButton("❓ Вопросы", callback_data="questions"),
+            ],
+        ]
+    )
 
 
 async def build_intro_message() -> str:
     data = await get_parsha_package()
-    title = html.escape(data["title"])
+
+    title = html.escape(data.get("title_ru") or data["title"])
     hebrew = html.escape(data.get("hebrew", ""))
     ref = html.escape(data.get("torah_ref", ""))
 
@@ -399,11 +423,13 @@ async def build_intro_message() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+
     if not is_allowed(user_id):
         await update.message.reply_text("У тебя нет доступа к этому боту.")
         return
 
     register_user(user_id)
+
     await update.message.reply_text(
         "Готово. Я буду присылать недельную главу по воскресеньям.\n\n"
         "Для теста нажми /send_now"
@@ -412,13 +438,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def send_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+
     if not is_allowed(user_id):
         await update.message.reply_text("У тебя нет доступа к этому боту.")
         return
 
     register_user(user_id)
+
     msg = await build_intro_message()
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
+    await update.message.reply_text(
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+    )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -436,25 +469,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         if action == "full":
-            text = f"📜 <b>Полная глава: {html.escape(data['title'])}</b>\n\n{html.escape(data['full_text'])}"
+            text = (
+                f"📜 <b>Полная глава: "
+                f"{html.escape(data.get('title_ru') or data['title'])}</b>\n\n"
+                f"{html.escape(data['full_text'])}"
+            )
             await send_long_message(context, query.message.chat_id, text)
 
         elif action == "summary":
             result = await generate_summary(data["full_text"])
-            await send_long_message(context, query.message.chat_id, f"✂️ <b>Кратко</b>\n\n{html.escape(result)}")
+            await send_long_message(
+                context,
+                query.message.chat_id,
+                f"✂️ <b>Кратко</b>\n\n{html.escape(result)}",
+            )
 
         elif action == "lesson":
             result = await generate_lesson(data["full_text"])
-            await send_long_message(context, query.message.chat_id, f"💡 <b>Смысл и урок</b>\n\n{html.escape(result)}")
+            await send_long_message(
+                context,
+                query.message.chat_id,
+                f"💡 <b>Смысл и урок</b>\n\n{html.escape(result)}",
+            )
 
         elif action == "questions":
             result = await generate_questions(data["full_text"])
-            await send_long_message(context, query.message.chat_id, f"❓ <b>Вопросы</b>\n\n{html.escape(result)}")
+            await send_long_message(
+                context,
+                query.message.chat_id,
+                f"❓ <b>Вопросы</b>\n\n{html.escape(result)}",
+            )
 
         elif action == "rashi":
             rashi = await fetch_rashi_commentary(data["torah_ref"])
             result = await generate_rashi_explanation(data["full_text"], rashi)
-            await send_long_message(context, query.message.chat_id, html.escape(result))
+            await send_long_message(
+                context,
+                query.message.chat_id,
+                html.escape(result),
+            )
 
         else:
             await query.message.reply_text("Неизвестная кнопка.")
@@ -468,6 +521,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def weekly_broadcast(app: Application) -> None:
     users = load_users()
+
     if not users:
         return
 
@@ -486,13 +540,13 @@ async def weekly_broadcast(app: Application) -> None:
                 disable_web_page_preview=True,
             )
         except Exception:
-            # Keep broadcasting to other users
             pass
 
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+        raise RuntimeError("Missing TELEGRAM_TOKEN")
+
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY")
 
@@ -503,6 +557,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(button_handler))
 
     scheduler = AsyncIOScheduler(timezone=SCHEDULE_TZ)
+
     scheduler.add_job(
         weekly_broadcast,
         trigger="cron",
@@ -513,11 +568,13 @@ def main() -> None:
         id="weekly_parsha_broadcast",
         replace_existing=True,
     )
+
     scheduler.start()
 
     print(
-        f"TorahBot started. Weekly schedule: {SCHEDULE_DAY_OF_WEEK} "
-        f"{SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} {SCHEDULE_TZ}"
+        f"TorahBot started. Weekly schedule: "
+        f"{SCHEDULE_DAY_OF_WEEK} {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} "
+        f"{SCHEDULE_TZ}"
     )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
