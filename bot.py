@@ -18,7 +18,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODELS_FAST", "gpt-4.1-mini")
+OPENAI_MODELS_RAW = os.getenv("OPENAI_MODELS_FAST", "gpt-4.1-mini")
 
 SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Asia/Dubai")
 SCHEDULE_DAY_OF_WEEK = os.getenv("SCHEDULE_DAY_OF_WEEK", "sun")
@@ -36,6 +36,11 @@ TORAH_FILE = Path("torah_ru_full.json")
 PARSHA_FILE = Path("parsha_map.json")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+def get_openai_models() -> List[str]:
+    models = [m.strip() for m in OPENAI_MODELS_RAW.split(",") if m.strip()]
+    return models or ["gpt-4.1-mini"]
 
 
 def load_users() -> List[int]:
@@ -128,6 +133,25 @@ def chunk_text(text: str, limit: int = 3800) -> List[str]:
         text = text[split_at:].strip()
 
     return chunks
+
+
+def split_into_pages(text: str, limit: int = 2600) -> List[str]:
+    text = text.strip()
+    pages = []
+    current = ""
+
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > limit:
+            if current.strip():
+                pages.append(current.strip())
+            current = line
+        else:
+            current += "\n" + line
+
+    if current.strip():
+        pages.append(current.strip())
+
+    return pages
 
 
 async def send_long_message(
@@ -347,16 +371,30 @@ async def ask_ai(task: str, source_text: str, extra: str = "") -> str:
 {clipped}
 """.strip()
 
-    response = await openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_RU},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.3,
-    )
+    last_error = None
 
-    return response.choices[0].message.content.strip()
+    for model in get_openai_models():
+        try:
+            response = await openai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_RU},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+
+            return response.choices[0].message.content.strip()
+
+        except Exception as e:
+            last_error = e
+            error_text = str(e).lower()
+
+            if "invalid model" in error_text or "model" in error_text:
+                continue
+
+            raise e
+
+    raise RuntimeError(f"Не удалось вызвать OpenAI model. Последняя ошибка: {last_error}")
 
 
 async def generate_summary(full_text: str) -> str:
@@ -442,6 +480,31 @@ def main_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def page_keyboard(next_page: int, total: int) -> InlineKeyboardMarkup:
+    buttons = []
+
+    if next_page < total:
+        buttons.append(
+            [InlineKeyboardButton("➡️ Читать дальше", callback_data=f"page_{next_page}")]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton("✂️ Кратко", callback_data="summary"),
+            InlineKeyboardButton("💡 Смысл", callback_data="lesson"),
+        ]
+    )
+
+    buttons.append(
+        [
+            InlineKeyboardButton("📚 Раши", callback_data="rashi"),
+            InlineKeyboardButton("❓ Вопросы", callback_data="questions"),
+        ]
+    )
+
+    return InlineKeyboardMarkup(buttons)
+
+
 async def build_intro_message() -> str:
     data = await get_parsha_package()
 
@@ -491,6 +554,41 @@ async def send_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def send_page(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    data: Dict[str, str],
+    page_index: int,
+) -> None:
+    pages = context.user_data.get("parsha_pages", [])
+
+    if not pages:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Ошибка: страницы не найдены. Нажми 📜 Полная глава ещё раз.",
+        )
+        return
+
+    total = len(pages)
+    page_text = pages[page_index]
+
+    title = html.escape(data.get("title_ru") or data["title"])
+
+    text = (
+        f"📜 <b>{title}</b>\n"
+        f"<b>Часть {page_index + 1} из {total}</b>\n\n"
+        f"{html.escape(page_text)}"
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=page_keyboard(page_index + 1, total),
+        disable_web_page_preview=True,
+    )
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user_id = query.from_user.id
@@ -501,17 +599,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await query.answer("Готовлю...")
 
-    data = await get_parsha_package()
     action = query.data
 
     try:
+        data = await get_parsha_package()
+
+        if action.startswith("page_"):
+            page_index = int(action.split("_")[1])
+            await send_page(context, query.message.chat_id, data, page_index)
+            return
+
         if action == "full":
-            text = (
-                f"📜 <b>Полная глава: "
-                f"{html.escape(data.get('title_ru') or data['title'])}</b>\n\n"
-                f"{html.escape(data['full_text'])}"
-            )
-            await send_long_message(context, query.message.chat_id, text)
+            pages = split_into_pages(data["full_text"])
+            context.user_data["parsha_pages"] = pages
+
+            await send_page(context, query.message.chat_id, data, 0)
 
         elif action == "summary":
             result = await generate_summary(data["full_text"])
@@ -519,6 +621,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context,
                 query.message.chat_id,
                 f"✂️ <b>Кратко</b>\n\n{html.escape(result)}",
+                reply_markup=main_keyboard(),
             )
 
         elif action == "lesson":
@@ -527,6 +630,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context,
                 query.message.chat_id,
                 f"💡 <b>Смысл и урок</b>\n\n{html.escape(result)}",
+                reply_markup=main_keyboard(),
             )
 
         elif action == "questions":
@@ -535,6 +639,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context,
                 query.message.chat_id,
                 f"❓ <b>Вопросы</b>\n\n{html.escape(result)}",
+                reply_markup=main_keyboard(),
             )
 
         elif action == "rashi":
@@ -544,6 +649,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context,
                 query.message.chat_id,
                 html.escape(result),
+                reply_markup=main_keyboard(),
             )
 
         else:
@@ -553,6 +659,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text(
             f"Ошибка при подготовке текста: {html.escape(str(e))}",
             parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
         )
 
 
@@ -611,7 +718,7 @@ def main() -> None:
     print(
         f"TorahBot started. Weekly schedule: "
         f"{SCHEDULE_DAY_OF_WEEK} {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} "
-        f"{SCHEDULE_TZ}"
+        f"{SCHEDULE_TZ}. OpenAI models: {', '.join(get_openai_models())}"
     )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
